@@ -1,0 +1,6 @@
+{
+  "name": "wire",
+  "description": "Wire for Grok — sidecar inbound (parent of grok agent stdio) plus MCP tools. No in-process SSE. Outbound is wire-ipc.",
+  "version": "0.1.0",
+  "keywords": ["wire", "grok", "sidecar", "mcp"]
+}
