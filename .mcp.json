@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "wire": {
+    "wire-grok": {
       "command": "bun",
       "args": ["run", "--cwd", "${GROK_PLUGIN_ROOT}", "--shell=bun", "--silent", "start"]
     }
