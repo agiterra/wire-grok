@@ -31,6 +31,7 @@ import { WireConnection } from "@agiterra/wire-tools/connection";
 import { importKeyPair } from "@agiterra/wire-tools/crypto";
 import { GrokAcpClient } from "./grok-acp.js";
 import { TurnGate, formatBatch, shouldSteerInFlight, type QueuedEvent } from "./gate.js";
+import { enrichInjectedPrompt } from "./enrich.js";
 import { startRpcHatch } from "./rpc-hatch.js";
 
 function requireEnv(name: string): string {
@@ -101,7 +102,7 @@ const grok = new GrokAcpClient({
 async function pump(): Promise<void> {
   const batch = gate.take();
   if (!batch) return;
-  const text = formatBatch(batch);
+  const text = await enrichInjectedPrompt(formatBatch(batch, { dest: agentId }), { cwd: projectDir, log });
   log("info", "injecting turn", { events: batch.length, pending: gate.pending });
   try {
     activeTurnId = await grok.startTurn(threadId, text);
@@ -148,7 +149,7 @@ async function main(): Promise<void> {
       };
       if (gate.busy && activeTurnId && shouldSteerInFlight(ev.topic)) {
         try {
-          await grok.steerTurn(threadId, activeTurnId, formatBatch([ev]));
+          await grok.steerTurn(threadId, activeTurnId, await enrichInjectedPrompt(formatBatch([ev], { dest: agentId }), { cwd: projectDir, log }));
           log("info", "steered deadline event into active turn", { topic: ev.topic, seq: ev.seq, turnId: activeTurnId });
           return;
         } catch (e) {
