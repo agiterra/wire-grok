@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "wire-grok": {
-      "command": "bun",
-      "args": ["run", "--cwd", "${GROK_PLUGIN_ROOT}", "--shell=bun", "--silent", "start"]
+      "command": "/opt/agiterra/bin/mcp-personai.sh",
+      "args": ["${GROK_PLUGIN_ROOT}/server.ts"]
     }
   }
 }
