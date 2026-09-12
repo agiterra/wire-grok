@@ -30,9 +30,19 @@ export function recordKickoff(stateDir: string, agentId: string, kickoffId: stri
 }
 /** The `task` text of a bridge.kickoff payload (object, or JSON string), or null when the shape is unknown. */
 export function kickoffTaskText(payload: unknown): string | null {
+  // bridge-tools POSTs the kickoff to the gateway's /webhooks/:dest/:topic, and the gateway delivers a webhook
+  // ENVELOPE: { source, topic: "webhook.bridge.kickoff", dest, plugin, headers, payload: { task, roles, ... } }.
+  // 0.1.1 read `.task` at the top level, found nothing, and silently skipped the dedupe (adhirasam 02:15Z, Brioche
+  // 612482). Descend through nested `.payload` envelopes (bounded) until a string `task` appears.
   let p: unknown = payload;
-  if (typeof p === "string") { try { p = JSON.parse(p); } catch { return null; } }
-  if (p && typeof p === "object" && typeof (p as { task?: unknown }).task === "string") return (p as { task: string }).task;
+  for (let depth = 0; depth < 4; depth++) {
+    if (typeof p === "string") { try { p = JSON.parse(p); } catch { return null; } }
+    if (!p || typeof p !== "object") return null;
+    const o = p as { task?: unknown; payload?: unknown };
+    if (typeof o.task === "string") return o.task;
+    if (o.payload === undefined) return null;
+    p = o.payload;
+  }
   return null;
 }
 /** True when this kickoff's brief was already delivered (same sha) — suppress it. */

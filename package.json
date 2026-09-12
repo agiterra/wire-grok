@@ -1,6 +1,6 @@
 {
   "name": "@agiterra/wire-grok",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Grok adapter for The Wire \u2014 two process layers, one package. (1) Sidecar parent: holds the one SSE and injects via grok agent stdio ACP session/prompt. Analog of codex-wire. (2) Grok plugin: MCP tools (set_plan/heartbeat/register) + skills. No in-process SSE. Outbound is wire-ipc (separate plugin).",
   "type": "module",
   "bin": {

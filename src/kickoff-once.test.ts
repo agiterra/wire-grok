@@ -12,6 +12,10 @@ describe("kickoff-once (j:1507)", () => {
   test("task text extracted from object and JSON-string payloads; unknown shapes -> null", () => {
     expect(kickoffTaskText({ task: "do X", roles: ["engineer"] })).toBe("do X");
     expect(kickoffTaskText(JSON.stringify({ task: "do Y" }))).toBe("do Y");
+    // the gateway's webhook envelope (what a lane actually receives) — the 0.1.1 miss
+    expect(kickoffTaskText({ source: "brioche", topic: "webhook.bridge.kickoff", dest: "lane", plugin: "bridge", headers: {}, payload: { task: "do Z", roles: ["engineer"], applied_capabilities: [] } })).toBe("do Z");
+    expect(kickoffTaskText({ payload: JSON.stringify({ payload: { task: "deep" } }) })).toBe("deep");
+    expect(kickoffTaskText({ payload: { payload: { payload: { payload: { task: "too deep" } } } } })).toBeNull();
     expect(kickoffTaskText({ text: "not a kickoff" })).toBeNull();
     expect(kickoffTaskText("plain text")).toBeNull();
   });
