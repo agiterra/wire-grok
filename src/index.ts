@@ -33,6 +33,7 @@ import { GrokAcpClient } from "./grok-acp.js";
 import { TurnGate, formatBatch, shouldSteerInFlight, type QueuedEvent } from "./gate.js";
 import { enrichInjectedPrompt } from "./enrich.js";
 import { startRpcHatch } from "./rpc-hatch.js";
+import { deriveKickoffId, isDuplicateKickoff, kickoffTaskText, readKickoff, recordKickoff } from "./kickoff-once.ts";
 
 function requireEnv(name: string): string {
   const v = process.env[name];
@@ -141,6 +142,15 @@ async function main(): Promise<void> {
     deliver: async ({ raw, channel }) => {
       if (hatch.handleEvent(raw)) return;
       if (SKIP_TOPICS.has(raw.topic)) return;
+      // Kickoff idempotency (j:1507): the bridge sends the brief as INITIAL_PROMPT AND as bridge.kickoff.
+      if (raw.topic === "bridge.kickoff" || raw.topic.endsWith(".bridge.kickoff")) {
+        const task = kickoffTaskText(raw.payload);
+        if (task !== null) {
+          const rec = readKickoff(stateDir, agentId);
+          if (isDuplicateKickoff(task, rec)) { log("info", "duplicate kickoff suppressed — same brief already delivered", { seq: raw.seq, kickoffId: rec?.kickoffId, deliveredAt: rec?.deliveredAt }); return; }
+          recordKickoff(stateDir, agentId, deriveKickoffId(task));
+        }
+      }
       const ev: QueuedEvent = {
         text: channel.text,
         topic: raw.topic,
@@ -183,6 +193,7 @@ async function main(): Promise<void> {
 
   const initialPrompt = process.env.INITIAL_PROMPT;
   if (initialPrompt && !t.resumed) {
+    recordKickoff(stateDir, agentId, deriveKickoffId(initialPrompt)); // the brief is now delivered once; a later bridge.kickoff with the same text is a duplicate (j:1507)
     if (gate.push({ text: initialPrompt, topic: "bridge.boot", source: "grok-wire-bridge", seq: undefined })) void pump();
   }
 
