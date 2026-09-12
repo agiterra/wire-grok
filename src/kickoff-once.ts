@@ -11,7 +11,13 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-export type KickoffRecord = { kickoffId: string; agentId: string; deliveredAt: string };
+export type KickoffRecord = {
+  kickoffId: string;
+  agentId: string;
+  deliveredAt: string;
+  /** Set when a later bridge.kickoff with the same brief was suppressed — the durable proof the dedupe fired (0.1.3). */
+  lastSuppressed?: { seq: number | undefined; at: string; count: number };
+};
 
 export function deriveKickoffId(text: string): string {
   return "sha256:" + createHash("sha256").update(text).digest("hex").slice(0, 32);
@@ -44,6 +50,13 @@ export function kickoffTaskText(payload: unknown): string | null {
     p = o.payload;
   }
   return null;
+}
+/** Record that a duplicate was suppressed: the sidecar's stderr lives only in the lane's screen, so the file is the evidence. */
+export function markSuppressed(stateDir: string, agentId: string, seq: number | undefined): void {
+  const rec = readKickoff(stateDir, agentId);
+  if (!rec) return;
+  rec.lastSuppressed = { seq, at: new Date().toISOString(), count: (rec.lastSuppressed?.count ?? 0) + 1 };
+  writeFileSync(kickoffPath(stateDir, agentId), JSON.stringify(rec) + "\n");
 }
 /** True when this kickoff's brief was already delivered (same sha) — suppress it. */
 export function isDuplicateKickoff(taskText: string, record: KickoffRecord | null): boolean {

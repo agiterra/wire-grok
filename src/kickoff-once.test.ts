@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deriveKickoffId, isDuplicateKickoff, kickoffTaskText, readKickoff, recordKickoff } from "./kickoff-once.ts";
+import { deriveKickoffId, isDuplicateKickoff, kickoffTaskText, markSuppressed, readKickoff, recordKickoff } from "./kickoff-once.ts";
 
 describe("kickoff-once (j:1507)", () => {
   test("id is content-derived and stable", () => {
@@ -26,5 +26,17 @@ describe("kickoff-once (j:1507)", () => {
     recordKickoff(dir, "lane", deriveKickoffId("brief A"));
     expect(isDuplicateKickoff("brief A", readKickoff(dir, "lane"))).toBe(true);
     expect(isDuplicateKickoff("brief B", readKickoff(dir, "lane"))).toBe(false);
+  });
+  test("suppression leaves a durable mark in the record; count accumulates; no record -> no-op", () => {
+    const dir = mkdtempSync(join(tmpdir(), "grok-kickoff-"));
+    markSuppressed(dir, "lane", 7); // no record yet
+    expect(readKickoff(dir, "lane")).toBeNull();
+    recordKickoff(dir, "lane", deriveKickoffId("brief A"));
+    markSuppressed(dir, "lane", 612465);
+    markSuppressed(dir, "lane", undefined);
+    const rec = readKickoff(dir, "lane");
+    expect(rec?.kickoffId).toBe(deriveKickoffId("brief A"));
+    expect(rec?.lastSuppressed?.count).toBe(2);
+    expect(isDuplicateKickoff("brief A", rec)).toBe(true); // still dedupes after the mark
   });
 });

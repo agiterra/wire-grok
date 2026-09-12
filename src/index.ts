@@ -33,7 +33,7 @@ import { GrokAcpClient } from "./grok-acp.js";
 import { TurnGate, formatBatch, shouldSteerInFlight, type QueuedEvent } from "./gate.js";
 import { enrichInjectedPrompt } from "./enrich.js";
 import { startRpcHatch } from "./rpc-hatch.js";
-import { deriveKickoffId, isDuplicateKickoff, kickoffTaskText, readKickoff, recordKickoff } from "./kickoff-once.ts";
+import { deriveKickoffId, isDuplicateKickoff, kickoffTaskText, markSuppressed, readKickoff, recordKickoff } from "./kickoff-once.ts";
 
 function requireEnv(name: string): string {
   const v = process.env[name];
@@ -150,7 +150,7 @@ async function main(): Promise<void> {
           log("warn", "bridge.kickoff payload shape unknown — no `task` string found, NOT deduped", { seq: raw.seq, payloadKeys: raw.payload && typeof raw.payload === "object" ? Object.keys(raw.payload as object) : typeof raw.payload });
         } else {
           const rec = readKickoff(stateDir, agentId);
-          if (isDuplicateKickoff(task, rec)) { log("info", "duplicate kickoff suppressed — same brief already delivered", { seq: raw.seq, kickoffId: rec?.kickoffId, deliveredAt: rec?.deliveredAt }); return; }
+          if (isDuplicateKickoff(task, rec)) { markSuppressed(stateDir, agentId, raw.seq); log("info", "duplicate kickoff suppressed — same brief already delivered", { seq: raw.seq, kickoffId: rec?.kickoffId, deliveredAt: rec?.deliveredAt }); return; }
           log("info", "bridge.kickoff carries a different brief — delivering", { seq: raw.seq, incoming: deriveKickoffId(task), recorded: rec?.kickoffId ?? null, taskLen: task.length });
           recordKickoff(stateDir, agentId, deriveKickoffId(task));
         }
