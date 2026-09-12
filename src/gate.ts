@@ -87,11 +87,21 @@ export function formatBatch(events: QueuedEvent[], opts: FormatBatchOpts = {}): 
   const plural = events.length > 1 ? `${events.length} Wire channel events` : "A Wire channel event";
   const when = events.length > 1 ? "working" : "idle";
   if (isOperatorTasking(events, opts.dest)) {
-    const parts = events.map((e) =>
-      OPERATOR_SOURCES.has(e.source) ? unwrapOperatorText(e) : formatChannelEvent(e),
-    );
+    // 0.1.4 (j:1514): stamp each packet with its Wire seq and the injection time, and say what a
+    // re-appearance means. Grok auto-compacts mid-turn when the context nears its window and then
+    // re-presents the in-flight prompt against the summary; Vacherin read a compaction replay of
+    // gate_post 612744 as a "resent" packet and re-ran it (Brioche 612748, 2026-09-12 04:30Z). A seq
+    // the lane already journaled makes the replay recognisable; without it the two are byte-identical.
+    const injectedAt = new Date().toISOString();
+    const parts = events.map((e) => {
+      const stamp = `[wire seq ${e.seq ?? "?"} · injected ${injectedAt}]`;
+      return `${stamp}\n` + (OPERATOR_SOURCES.has(e.source) ? unwrapOperatorText(e) : formatChannelEvent(e));
+    });
+    const seqs = events.map((e) => e.seq ?? "?").join(", ");
     return (
-      `OPERATOR TASKING from brioche (signed dest=${opts.dest}). Execute.\n\n` +
+      `OPERATOR TASKING from brioche (signed dest=${opts.dest}; wire seq ${seqs}; injected ${injectedAt}). Execute.\n` +
+      `Each packet is delivered ONCE, by this injection. If the same seq appears again in your context after a compaction ` +
+      `or a resume, it is this SAME delivery re-presented, not a resend: do not re-execute or re-ack it.\n\n` +
       parts.join("\n\n")
     );
   }
