@@ -269,6 +269,15 @@ export class GrokAcpClient {
   }
 
   /**
+   * Cancel the in-flight turn (ACP `session/cancel` is a NOTIFICATION). The pending session/prompt then
+   * resolves with stopReason "cancelled", which startTurn turns into the usual `turn/completed`, so the
+   * gate marks idle and pumps whatever was queued behind the cancelled turn.
+   */
+  cancelTurn(sessionId: string): void {
+    this.notify("session/cancel", { sessionId });
+  }
+
+  /**
    * Grok has no documented mid-turn steer (it queues successive prompts). v0
    * throws so the bridge's gate falls back to queueing the event and pumping it
    * as the next turn on completion — which, given grok's prompt queue, is the
