@@ -33,6 +33,8 @@ import { GrokAcpClient } from "./grok-acp.js";
 import { TurnGate, formatBatch, shouldSteerInFlight, type QueuedEvent } from "./gate.js";
 import { enrichInjectedPrompt } from "./enrich.js";
 import { startRpcHatch } from "./rpc-hatch.js";
+import { isCancelTopic, decideCancel, DEFAULT_CONTROL_ALLOW } from "./control.js";
+import { sendSignedMessage } from "@agiterra/wire-tools/http";
 import { deriveKickoffId, isDuplicateKickoff, kickoffTaskText, markSuppressed, readKickoff, recordKickoff } from "./kickoff-once.ts";
 
 function requireEnv(name: string): string {
@@ -142,6 +144,18 @@ async function main(): Promise<void> {
     deliver: async ({ raw, channel }) => {
       if (hatch.handleEvent(raw)) return;
       if (SKIP_TOPICS.has(raw.topic)) return;
+      // Operator cancel (0.1.5): never a model turn. Reply to the sender with what happened.
+      if (isCancelTopic(raw.topic)) {
+        const result = decideCancel(raw.source, activeTurnId, process.env.BRIDGE_CONTROL_ALLOW ?? DEFAULT_CONTROL_ALLOW);
+        if (result.ok && result.cancelled) grok.cancelTurn(threadId);
+        log(result.ok ? "info" : "warn", "bridge.cancel", { from: raw.source, seq: raw.seq, ...result });
+        if (raw.source) {
+          await sendSignedMessage(wireUrl, agentId, keyPair.privateKey, "bridge.cancel.result",
+            { lane: agentId, request_seq: raw.seq ?? null, ...result }, raw.source)
+            .catch((e: unknown) => log("error", "bridge.cancel.result send failed", { to: raw.source, err: String(e) }));
+        }
+        return;
+      }
       // Kickoff idempotency (j:1507): the bridge sends the brief as INITIAL_PROMPT AND as bridge.kickoff.
       if (raw.topic === "bridge.kickoff" || raw.topic.endsWith(".bridge.kickoff")) {
         const task = kickoffTaskText(raw.payload);
