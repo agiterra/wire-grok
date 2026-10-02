@@ -20,6 +20,9 @@
  *   GROK_MODEL          optional — model id (default grok-4.5)
  *   GROK_BIN            optional — grok binary path (default: "grok" on PATH)
  *   STATE_DIR           optional — sessionId persistence (default ~/.wire/grok-bridge)
+ *   GROK_TURN_TIMEOUT_SECS       optional — per-turn IDLE timeout (default 600; 0 disables; turn-timeout.ts)
+ *   GROK_TURN_CANCEL_GRACE_SECS  optional — wait after session/cancel before abandoning (default 30)
+ *   GROK_TURN_TIMEOUT_NOTIFY     optional — csv of agents told about a timed-out turn (default brioche)
  *
  * Outbound is NOT this bridge's job: grok agents send via their wire-ipc MCP
  * entry in ~/.grok/config.toml, unchanged.
@@ -35,6 +38,7 @@ import { enrichInjectedPrompt } from "./enrich.js";
 import { startRpcHatch } from "./rpc-hatch.js";
 import { isCancelTopic, decideCancel, DEFAULT_CONTROL_ALLOW } from "./control.js";
 import { sendSignedMessage } from "@agiterra/wire-tools/http";
+import { turnTimeoutFromEnv, timeoutNotice, DEFAULT_TIMEOUT_NOTIFY, type TimeoutInfo } from "./turn-timeout.js";
 import { deriveKickoffId, isDuplicateKickoff, kickoffTaskText, markSuppressed, readKickoff, recordKickoff } from "./kickoff-once.ts";
 
 function requireEnv(name: string): string {
@@ -74,6 +78,9 @@ function writeState(threadId: string): void {
 const gate = new TurnGate();
 let threadId = "";
 let activeTurnId = "";
+let activeBatch: QueuedEvent[] = [];
+let signingKey: CryptoKey | null = null;
+const turnTimeout = turnTimeoutFromEnv(process.env, (msg) => log("warn", msg));
 
 // System topics that must never become model turns — a model invocation per
 // keepalive is pure token burn carrying zero information.
@@ -92,15 +99,33 @@ const grok = new GrokAcpClient({
   cwd: projectDir,
   model,
   log: (level, msg, fields) => log(level, msg, fields),
+  turnTimeout,
   onNotification: (method, params) => {
     if (method === "turn/completed") {
-      const turn = (params as { turn?: { status?: string; usage?: unknown } }).turn;
-      log("info", "turn completed", { status: turn?.status, usage: turn?.usage });
+      const turn = (params as { turn?: { id?: string; status?: string; usage?: unknown; timeout?: TimeoutInfo } }).turn;
+      log(turn?.status === "timeout" ? "error" : "info", "turn completed", { status: turn?.status, usage: turn?.usage, timeout: turn?.timeout });
+      if (turn?.status === "timeout" && turn.timeout) reportTimeout(turn.id ?? activeTurnId, turn.timeout, activeBatch);
       activeTurnId = "";
+      activeBatch = [];
       if (gate.complete()) void pump();
     }
   },
 });
+
+/** A timed-out turn is announced on the Wire (ASK-54): its senders got no answer, and the lane may be wedged. */
+function reportTimeout(turnId: string, info: TimeoutInfo, batch: QueuedEvent[]): void {
+  const { dests, payload } = timeoutNotice({
+    lane: agentId, turnId, info, batch,
+    notifyCsv: process.env.GROK_TURN_TIMEOUT_NOTIFY ?? DEFAULT_TIMEOUT_NOTIFY,
+    operatorCsv: process.env.BRIDGE_CONTROL_ALLOW ?? DEFAULT_CONTROL_ALLOW,
+  });
+  if (!signingKey) { log("error", "turn timeout NOT reported — no signing key yet", { turnId, dests }); return; }
+  for (const dest of dests) {
+    sendSignedMessage(wireUrl, agentId, signingKey, "bridge.turn.timeout", payload, dest)
+      .then(() => log("info", "bridge.turn.timeout sent", { to: dest, turnId }))
+      .catch((e: unknown) => log("error", "bridge.turn.timeout send failed", { to: dest, turnId, err: String(e) }));
+  }
+}
 
 async function pump(): Promise<void> {
   const batch = gate.take();
@@ -108,6 +133,7 @@ async function pump(): Promise<void> {
   const text = await enrichInjectedPrompt(formatBatch(batch, { dest: agentId }), { cwd: projectDir, log });
   log("info", "injecting turn", { events: batch.length, pending: gate.pending });
   try {
+    activeBatch = batch;
     activeTurnId = await grok.startTurn(threadId, text);
   } catch (e) {
     // prompt refused (e.g. a race with an active turn): re-mark idle so the
@@ -120,6 +146,7 @@ async function pump(): Promise<void> {
 
 async function main(): Promise<void> {
   const keyPair = await importKeyPair(requireEnv("AGENT_PRIVATE_KEY"));
+  signingKey = keyPair.privateKey;
   const rpcSock = process.env.GROK_RPC_SOCK ?? join(stateDir, `${agentId}.rpc.sock`);
   process.env.GROK_RPC_SOCK = rpcSock;
   const hatch = startRpcHatch({
@@ -215,7 +242,7 @@ async function main(): Promise<void> {
     if (gate.push({ text: initialPrompt, topic: "bridge.boot", source: "grok-wire-bridge", seq: undefined })) void pump();
   }
 
-  log("info", "bridge up", { threadId, resumed: t.resumed, projectDir, wireUrl, model });
+  log("info", "bridge up", { threadId, resumed: t.resumed, projectDir, wireUrl, model, turnTimeout });
 }
 
 main().catch((e) => {

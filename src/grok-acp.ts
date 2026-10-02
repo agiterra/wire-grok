@@ -38,6 +38,7 @@
 
 import { spawn, type ChildProcessByStdio } from "child_process";
 import type { Readable, Writable } from "stream";
+import type { TurnTimeoutConfig } from "./turn-timeout.js";
 
 type Json = Record<string, unknown>;
 type Pending = { resolve: (v: Json) => void; reject: (e: Error) => void };
@@ -78,6 +79,19 @@ export type GrokAcpOptions = {
   grokBin?: string;
   onNotification?: (method: string, params: Json) => void;
   log?: (level: "info" | "warn" | "error", msg: string, fields?: Json) => void;
+  /** Per-turn IDLE timeout (0.1.6, see turn-timeout.ts). Omitted or idleMs 0 = no timeout. */
+  turnTimeout?: TurnTimeoutConfig;
+};
+
+/** The one turn in flight (TurnGate serializes, so there is never more than one). */
+type ActiveTurn = {
+  turnId: string;
+  reqId: number;
+  idleTimer: ReturnType<typeof setTimeout> | null;
+  graceTimer: ReturnType<typeof setTimeout> | null;
+  /** Set when the idle timer fired: whatever ends the turn now, it ends as "timeout". */
+  timedOut: boolean;
+  sessionId: string;
 };
 
 export class GrokAcpClient {
@@ -88,6 +102,7 @@ export class GrokAcpClient {
   private opts: GrokAcpOptions;
   private turnCounter = 1;
   private loadSession = false;
+  private turn: ActiveTurn | null = null;
 
   constructor(opts: GrokAcpOptions) {
     this.opts = opts;
@@ -172,6 +187,7 @@ export class GrokAcpClient {
     }
 
     if (id != null && method != null) {
+      this.touchTurn();
       // Server->client REQUEST — must answer or grok stalls.
       if (method.includes("request_permission") || method.endsWith("/permission")) {
         this.grantPermission(id, (msg.params ?? {}) as Json);
@@ -186,7 +202,9 @@ export class GrokAcpClient {
       // Notification. Grok's own bookkeeping is _x.ai/*; ignore it (completion
       // is taken from the session/prompt response, not the duplicate
       // _x.ai/session_notification turn_completed). Forward anything else.
+      // _x.ai/* is NOT turn activity: only session/update proves the turn is producing output.
       if (method.startsWith("_x.ai/")) return;
+      this.touchTurn();
       this.opts.onNotification?.(method, (msg.params ?? {}) as Json);
     }
   }
@@ -207,11 +225,16 @@ export class GrokAcpClient {
   }
 
   request(method: string, params?: Json): Promise<Json> {
+    return this.requestWithId(method, params).promise;
+  }
+
+  private requestWithId(method: string, params?: Json): { id: number; promise: Promise<Json> } {
     const id = this.nextId++;
-    return new Promise((resolve, reject) => {
+    const promise = new Promise<Json>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       this.send({ method, id, ...(params ? { params } : {}) });
     });
+    return { id, promise };
   }
 
   notify(method: string, params?: Json): void {
@@ -238,7 +261,10 @@ export class GrokAcpClient {
     const r = await this.request("session/new", { cwd: this.opts.cwd, mcpServers: [] });
     const sessionId = (r.sessionId ?? (r.session as Json | undefined)?.sessionId ?? r.id) as string | undefined;
     if (!sessionId) throw new Error(`session/new returned no sessionId: ${JSON.stringify(r)}`);
-    this.log("info", "grok session started", { sessionId, model: (r.models as Json | undefined)?.currentModelId });
+    const models = r.models as Json | undefined;
+    const current = (models?.availableModels as Json[] | undefined)?.find((m) => m.modelId === models?.currentModelId);
+    // reasoningEffort is what grok APPLIED: argv accepts any string, so the session answer is the proof (Brioche 651638).
+    this.log("info", "grok session started", { sessionId, model: models?.currentModelId, reasoningEffort: (current?._meta as Json | undefined)?.reasoningEffort ?? null });
     return { threadId: sessionId, resumed: false };
   }
 
@@ -246,26 +272,78 @@ export class GrokAcpClient {
    * Fire a prompt turn. Returns a synthetic turnId IMMEDIATELY (grok's
    * session/prompt resolves only at completion, so we can't block here). On
    * resolution we synthesize the `turn/completed` notification index.ts expects,
-   * carrying grok's stopReason + token usage.
+   * carrying grok's stopReason + token usage. With a turnTimeout, a turn that
+   * produces nothing for idleMs is cancelled and completes as status "timeout"
+   * (see turn-timeout.ts); `turn/completed` fires exactly once per turn either way.
    */
   startTurn(sessionId: string, text: string): Promise<string> {
     const turnId = String(this.turnCounter++);
-    this.request("session/prompt", {
+    const { id: reqId, promise } = this.requestWithId("session/prompt", {
       sessionId,
       prompt: [{ type: "text", text }],
-    })
+    });
+    const turn: ActiveTurn = { turnId, reqId, idleTimer: null, graceTimer: null, timedOut: false, sessionId };
+    this.turn = turn;
+    this.armIdle(turn);
+    promise
       .then((r) => {
         const meta = (r._meta ?? {}) as Json;
-        this.opts.onNotification?.("turn/completed", {
-          turn: { id: turnId, status: r.stopReason ?? "end_turn", usage: meta.usage ?? null },
-        });
+        if (turn.timedOut) {
+          this.finishTurn(turn, { status: "timeout", stopReason: r.stopReason ?? null, usage: meta.usage ?? null,
+            timeout: { idleMs: this.opts.turnTimeout!.idleMs, cancelHonored: true } });
+        } else {
+          this.finishTurn(turn, { status: r.stopReason ?? "end_turn", usage: meta.usage ?? null });
+        }
       })
       .catch((e) => {
         this.log("error", "session/prompt failed", { turnId, err: String(e) });
-        this.opts.onNotification?.("turn/completed", { turn: { id: turnId, status: "error" } });
+        this.finishTurn(turn, turn.timedOut
+          ? { status: "timeout", timeout: { idleMs: this.opts.turnTimeout!.idleMs, cancelHonored: false } }
+          : { status: "error" });
       });
     // Resolve synchronously-ish so the gate marks the turn in-flight immediately.
     return Promise.resolve(turnId);
+  }
+
+  private armIdle(turn: ActiveTurn): void {
+    const idleMs = this.opts.turnTimeout?.idleMs ?? 0;
+    if (idleMs <= 0) return;
+    if (turn.idleTimer) clearTimeout(turn.idleTimer);
+    turn.idleTimer = setTimeout(() => this.onIdle(turn), idleMs);
+  }
+
+  /** Output from grok for the running turn: restart its idle clock (not once cancelling). */
+  private touchTurn(): void {
+    const turn = this.turn;
+    if (turn && !turn.timedOut) this.armIdle(turn);
+  }
+
+  private onIdle(turn: ActiveTurn): void {
+    if (this.turn !== turn) return;
+    const { idleMs, graceMs } = this.opts.turnTimeout!;
+    turn.timedOut = true;
+    turn.idleTimer = null;
+    this.log("error", "turn idle timeout — no output from grok; sending session/cancel", { turnId: turn.turnId, idleMs, graceMs });
+    try {
+      this.cancelTurn(turn.sessionId);
+    } catch (e) {
+      this.log("error", "session/cancel send failed on timeout", { turnId: turn.turnId, err: String(e) });
+    }
+    turn.graceTimer = setTimeout(() => {
+      if (this.turn !== turn) return;
+      // The prompt never resolved, even after cancel: abandon it. A late reply for reqId is dropped by dispatch.
+      this.pending.delete(turn.reqId);
+      this.log("error", "session/cancel not honoured within grace — abandoning the turn; grok child may be wedged", { turnId: turn.turnId, graceMs });
+      this.finishTurn(turn, { status: "timeout", timeout: { idleMs, cancelHonored: false } });
+    }, graceMs);
+  }
+
+  private finishTurn(turn: ActiveTurn, fields: Json): void {
+    if (this.turn !== turn) return; // already completed (timeout path won, or vice versa)
+    if (turn.idleTimer) clearTimeout(turn.idleTimer);
+    if (turn.graceTimer) clearTimeout(turn.graceTimer);
+    this.turn = null;
+    this.opts.onNotification?.("turn/completed", { turn: { id: turn.turnId, ...fields } });
   }
 
   /**
