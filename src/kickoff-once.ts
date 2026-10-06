@@ -62,3 +62,11 @@ export function markSuppressed(stateDir: string, agentId: string, seq: number | 
 export function isDuplicateKickoff(taskText: string, record: KickoffRecord | null): boolean {
   return !!record && record.kickoffId === deriveKickoffId(taskText);
 }
+
+/** AGI-180: true when THIS process already delivered `initialPrompt` through a bridge.kickoff replayed during connect.
+ *  Scoped to a record written since `sinceMs` (process start): an older record of the same brief belongs to an earlier
+ *  boot, and this module has never suppressed a fresh-thread re-delivery, so that behaviour stays unchanged. */
+export function bootKickoffAlreadyDelivered(initialPrompt: string, record: KickoffRecord | null, sinceMs: number = BOOT_MS): boolean {
+  return isDuplicateKickoff(initialPrompt, record) && Date.parse(record!.deliveredAt) >= sinceMs;
+}
+const BOOT_MS = Date.now() - Math.round(process.uptime() * 1000);

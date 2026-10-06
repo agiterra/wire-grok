@@ -39,7 +39,7 @@ import { startRpcHatch } from "./rpc-hatch.js";
 import { isCancelTopic, decideCancel, DEFAULT_CONTROL_ALLOW } from "./control.js";
 import { sendSignedMessage } from "@agiterra/wire-tools/http";
 import { turnTimeoutFromEnv, timeoutNotice, DEFAULT_TIMEOUT_NOTIFY, type TimeoutInfo } from "./turn-timeout.js";
-import { deriveKickoffId, isDuplicateKickoff, kickoffTaskText, markSuppressed, readKickoff, recordKickoff } from "./kickoff-once.ts";
+import { bootKickoffAlreadyDelivered, deriveKickoffId, isDuplicateKickoff, kickoffTaskText, markSuppressed, readKickoff, recordKickoff } from "./kickoff-once.ts";
 
 function requireEnv(name: string): string {
   const v = process.env[name];
@@ -237,7 +237,12 @@ async function main(): Promise<void> {
   clearInterval(warn);
 
   const initialPrompt = process.env.INITIAL_PROMPT;
-  if (initialPrompt && !t.resumed) {
+  // AGI-180: the Wire copy (bridge.kickoff) can be replayed during conn.start(), BEFORE this line. The Wire path then
+  // recorded and queued it, and pushing INITIAL_PROMPT here delivered the same brief a second time (codex lanes
+  // eng222/eng224-4685-api, 2026-10-06; same order here). Skip the push when that brief is already recorded.
+  if (initialPrompt && !t.resumed && bootKickoffAlreadyDelivered(initialPrompt, readKickoff(stateDir, agentId))) {
+    log("info", "INITIAL_PROMPT not pushed — the same brief already arrived as bridge.kickoff (AGI-180)", { kickoffId: deriveKickoffId(initialPrompt) });
+  } else if (initialPrompt && !t.resumed) {
     recordKickoff(stateDir, agentId, deriveKickoffId(initialPrompt)); // the brief is now delivered once; a later bridge.kickoff with the same text is a duplicate (j:1507)
     if (gate.push({ text: initialPrompt, topic: "bridge.boot", source: "grok-wire-bridge", seq: undefined })) void pump();
   }

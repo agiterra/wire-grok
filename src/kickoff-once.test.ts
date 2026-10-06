@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deriveKickoffId, isDuplicateKickoff, kickoffTaskText, markSuppressed, readKickoff, recordKickoff } from "./kickoff-once.ts";
+import { bootKickoffAlreadyDelivered, deriveKickoffId, isDuplicateKickoff, kickoffTaskText, markSuppressed, readKickoff, recordKickoff } from "./kickoff-once.ts";
 
 describe("kickoff-once (j:1507)", () => {
   test("id is content-derived and stable", () => {
@@ -38,5 +38,29 @@ describe("kickoff-once (j:1507)", () => {
     expect(rec?.kickoffId).toBe(deriveKickoffId("brief A"));
     expect(rec?.lastSuppressed?.count).toBe(2);
     expect(isDuplicateKickoff("brief A", rec)).toBe(true); // still dedupes after the mark
+  });
+});
+
+describe("bootKickoffAlreadyDelivered (AGI-180)", () => {
+  const brief = "You are eng300-1-api. Your brief is /tmp/baguette-briefs/eng300-1-api/BRIEF.md";
+  test("Wire copy recorded during this boot -> boot does NOT push INITIAL_PROMPT again", () => {
+    const d = mkdtempSync(join(tmpdir(), "wg-boot-"));
+    const since = Date.now() - 1000;
+    recordKickoff(d, "a", deriveKickoffId(brief));          // the Wire path, during conn.start()
+    expect(bootKickoffAlreadyDelivered(brief, readKickoff(d, "a"), since)).toBe(true);
+  });
+  test("no record -> push (the normal boot)", () => {
+    const d = mkdtempSync(join(tmpdir(), "wg-boot-"));
+    expect(bootKickoffAlreadyDelivered(brief, readKickoff(d, "a"), 0)).toBe(false);
+  });
+  test("record from an EARLIER boot -> push (fresh-thread re-delivery unchanged)", () => {
+    const d = mkdtempSync(join(tmpdir(), "wg-boot-"));
+    recordKickoff(d, "a", deriveKickoffId(brief));
+    expect(bootKickoffAlreadyDelivered(brief, readKickoff(d, "a"), Date.now() + 60_000)).toBe(false);
+  });
+  test("different brief recorded -> push", () => {
+    const d = mkdtempSync(join(tmpdir(), "wg-boot-"));
+    recordKickoff(d, "a", deriveKickoffId("other task"));
+    expect(bootKickoffAlreadyDelivered(brief, readKickoff(d, "a"), 0)).toBe(false);
   });
 });
