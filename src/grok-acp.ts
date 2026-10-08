@@ -40,6 +40,13 @@ import { spawn, type ChildProcessByStdio } from "child_process";
 import type { Readable, Writable } from "stream";
 import type { TurnTimeoutConfig } from "./turn-timeout.js";
 
+/** Keep the Wire signing key in the sidecar, outside the Grok child and its shell tools. */
+export function grokChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const childEnv = { ...env };
+  delete childEnv.AGENT_PRIVATE_KEY;
+  return childEnv;
+}
+
 type Json = Record<string, unknown>;
 type Pending = { resolve: (v: Json) => void; reject: (e: Error) => void };
 
@@ -129,7 +136,7 @@ export class GrokAcpClient {
     const child = spawn(bin, args, {
       stdio: ["pipe", "pipe", "inherit"],
       cwd: this.opts.cwd,
-      env: process.env,
+      env: grokChildEnv(process.env),
     });
     this.child = child;
     child.stdout.setEncoding("utf8");

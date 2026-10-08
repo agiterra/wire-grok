@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { buildGrokAgentStdioArgs } from "./grok-acp.js";
+import { buildGrokAgentStdioArgs, grokChildEnv } from "./grok-acp.js";
+
+test("Grok child cannot inherit the Wire signing key", () => {
+  const parent = { AGENT_PRIVATE_KEY: "private", AGENT_ID: "lane", PATH: "/bin" };
+  expect(grokChildEnv(parent)).toEqual({ AGENT_ID: "lane", PATH: "/bin" });
+  expect(parent.AGENT_PRIVATE_KEY).toBe("private");
+});
 
 describe("buildGrokAgentStdioArgs", () => {
   test("puts flags on grok agent BEFORE the stdio subcommand", () => {
