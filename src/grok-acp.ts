@@ -88,6 +88,8 @@ export type GrokAcpOptions = {
   log?: (level: "info" | "warn" | "error", msg: string, fields?: Json) => void;
   /** Per-turn IDLE timeout (0.1.6, see turn-timeout.ts). Omitted or idleMs 0 = no timeout. */
   turnTimeout?: TurnTimeoutConfig;
+  /** grok's stderr. Given: piped here (never the terminal directly, see log-sink.ts). Omitted: inherited, as before. */
+  onStderr?: (chunk: Buffer) => void;
 };
 
 /** The one turn in flight (TurnGate serializes, so there is never more than one). */
@@ -134,13 +136,14 @@ export class GrokAcpClient {
     });
     this.log("info", "spawning grok agent stdio", { bin, args });
     const child = spawn(bin, args, {
-      stdio: ["pipe", "pipe", "inherit"],
+      stdio: ["pipe", "pipe", this.opts.onStderr ? "pipe" : "inherit"],
       cwd: this.opts.cwd,
       env: grokChildEnv(process.env),
     });
     this.child = child;
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => this.onData(chunk));
+    if (this.opts.onStderr && child.stderr) child.stderr.on("data", (chunk: Buffer) => this.opts.onStderr!(chunk));
     child.on("exit", (code: number | null) => {
       this.log("error", "grok agent stdio exited", { code });
       for (const [, p] of this.pending) p.reject(new Error(`grok agent exited (code ${code})`));

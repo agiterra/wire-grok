@@ -38,6 +38,7 @@ import { enrichInjectedPrompt } from "./enrich.js";
 import { startRpcHatch } from "./rpc-hatch.js";
 import { isCancelTopic, decideCancel, DEFAULT_CONTROL_ALLOW } from "./control.js";
 import { sendSignedMessage } from "@agiterra/wire-tools/http";
+import { LogSink } from "./log-sink.ts";
 import { turnTimeoutFromEnv, timeoutNotice, DEFAULT_TIMEOUT_NOTIFY, type TimeoutInfo } from "./turn-timeout.js";
 import { bootKickoffAlreadyDelivered, deriveKickoffId, isDuplicateKickoff, kickoffTaskText, markSuppressed, readKickoff, recordKickoff } from "./kickoff-once.ts";
 
@@ -58,8 +59,15 @@ const model = process.env.GROK_MODEL ?? "grok-4.5";
 const stateDir = process.env.STATE_DIR ?? join(process.env.HOME ?? "/tmp", ".wire", "grok-bridge");
 const statePath = join(stateDir, `${agentId}.json`);
 
+// Never console.error: a synchronous terminal write that stalls stops every timer, the turn idle timeout included
+// (log-sink.ts). The file is the evidence; the screen shows it through `tail -F`, which can block without blocking us.
+// GROK_HOME is a lane's own dir, which lane-reap already removes; GROK_BRIDGE_LOG overrides.
+const logFile = process.env.GROK_BRIDGE_LOG
+  || (process.env.GROK_HOME ? join(process.env.GROK_HOME, "bridge.log") : join(stateDir, `${agentId}.bridge.log`));
+const sink = new LogSink({ file: logFile, tty: true });
+
 function log(level: string, msg: string, fields?: Record<string, unknown>) {
-  console.error(JSON.stringify({ t: new Date().toISOString(), level, name: "grok-wire-bridge", agent: agentId, msg, ...fields }));
+  sink.line(JSON.stringify({ t: new Date().toISOString(), level, name: "grok-wire-bridge", agent: agentId, msg, ...fields }));
 }
 
 function readState(): { threadId: string } | null {
@@ -99,6 +107,7 @@ const grok = new GrokAcpClient({
   cwd: projectDir,
   model,
   log: (level, msg, fields) => log(level, msg, fields),
+  onStderr: (chunk) => sink.raw(chunk),
   turnTimeout,
   onNotification: (method, params) => {
     if (method === "turn/completed") {
@@ -247,7 +256,7 @@ async function main(): Promise<void> {
     if (gate.push({ text: initialPrompt, topic: "bridge.boot", source: "grok-wire-bridge", seq: undefined })) void pump();
   }
 
-  log("info", "bridge up", { threadId, resumed: t.resumed, projectDir, wireUrl, model, turnTimeout });
+  log("info", "bridge up", { threadId, resumed: t.resumed, projectDir, wireUrl, model, turnTimeout, logFile });
 }
 
 main().catch((e) => {
