@@ -86,4 +86,32 @@ setTimeout(() => process.exit(0), 1500);`);
     expect(() => sink.line("still logs")).not.toThrow();
     expect(existsSync("/nonexistent-root-dir")).toBe(false);
   });
+  test("terminal loss: when the screen closes, the owner is told and exits (the old EIO death, kept)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "log-sink-"));
+    const script = join(dir, "c.ts");
+    writeFileSync(script, `import { writeFileSync } from "node:fs";
+import { LogSink } from ${JSON.stringify(SINK)};
+const s = new LogSink({ file: ${JSON.stringify(join(dir, "b.log"))}, tty: true,
+  onTerminalLost: () => { writeFileSync(${JSON.stringify(join(dir, "lost"))}, "1"); process.exit(129); } });
+setInterval(() => s.line("tick " + Date.now()), 100);`);
+    const py = `
+import os, pty, subprocess, sys, time
+m, s = pty.openpty()
+p = subprocess.Popen([sys.argv[1], sys.argv[2]], stdin=s, stdout=s, stderr=s, start_new_session=True)
+os.close(s)
+end = time.time() + 1.5
+while time.time() < end:
+    try: os.read(m, 65536)
+    except OSError: break
+os.close(m)
+deadline = time.time() + 8
+while p.poll() is None and time.time() < deadline: time.sleep(0.1)
+alive = p.poll() is None
+if alive: os.killpg(p.pid, 9)
+print("ALIVE" if alive else "EXITED", p.returncode)
+`;
+    const out = spawnSync("python3", ["-c", py, BUN, script], { encoding: "utf8", timeout: 15000 }).stdout;
+    expect(out).toContain("EXITED");
+    expect(existsSync(join(dir, "lost"))).toBe(true);
+  }, 20000);
 });

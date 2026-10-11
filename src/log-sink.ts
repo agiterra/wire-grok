@@ -12,17 +12,23 @@
  * through a `tail -F` child whose stdout is the terminal: if the terminal stalls, tail blocks, the bridge does not,
  * and nothing is buffered in the bridge. The tail is killed when the bridge's pid goes away (macOS tail has no --pid),
  * so it cannot keep a dead lane's screen alive. grok's stderr is appended the same way.
+ *
+ * TERMINAL LOSS: `screen -X quit` delivers NO SIGHUP to a quiet process (measured: an idle bun survives it). The old
+ * bridge died only because its next console.error hit EIO on the closed pty. With no terminal writes it would outlive
+ * its screen forever. So the tail is the probe: its next copy hits the same EIO, it exits, the watcher exits with it,
+ * and `onTerminalLost` fires (the bridge exits). Same latency as before: the next log line.
  * A sink failure never throws into the caller: an unwritable file falls back to the terminal, once announced.
  */
 import { appendFileSync, mkdirSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 
-export type LogSinkOpts = { file: string; tty: boolean; watchPid?: number };
+export type LogSinkOpts = { file: string; tty: boolean; watchPid?: number; onTerminalLost?: () => void };
 
 export class LogSink {
   private relay: ChildProcess | null = null;
   private fileFailed = false;
+  private stopping = false;
 
   constructor(private readonly opts: LogSinkOpts) {
     let size = 0;
@@ -38,14 +44,16 @@ export class LogSink {
 
   private startRelay(fromByte: number): void {
     const pid = this.opts.watchPid ?? process.pid;
-    // $0 = file, $1 = start byte (1-based), $2 = owner pid. The loop ends tail when the owner is gone.
-    const script = 'tail -c +"$1" -F "$0" & t=$!; while kill -0 "$2" 2>/dev/null; do sleep 2; done; kill "$t" 2>/dev/null';
+    // $0 = file, $1 = start byte (1-based), $2 = owner pid. The loop ends when the owner is gone (then it kills tail)
+    // or when tail is gone (terminal lost: then the owner hears about it through our exit).
+    const script = 'tail -c +"$1" -F "$0" & t=$!; while kill -0 "$2" 2>/dev/null && kill -0 "$t" 2>/dev/null; do sleep 1; done; kill "$t" 2>/dev/null; wait "$t"';
     try {
       const r = spawn("/bin/sh", ["-c", script, this.opts.file, String(fromByte + 1), String(pid)],
         { stdio: ["ignore", "inherit", "inherit"], detached: false });
       r.on("exit", (code, sig) => {
         this.relay = null;
         this.toFile(`[log-sink] terminal tail exited (code ${code}, signal ${sig}); the log file is still written\n`);
+        if (!this.stopping) this.opts.onTerminalLost?.();
       });
       r.unref();
       this.relay = r;
@@ -82,6 +90,7 @@ export class LogSink {
   }
 
   stop(): void {
+    this.stopping = true;
     this.relay?.kill();
     this.relay = null;
   }

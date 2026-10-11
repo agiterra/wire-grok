@@ -64,7 +64,11 @@ const statePath = join(stateDir, `${agentId}.json`);
 // GROK_HOME is a lane's own dir, which lane-reap already removes; GROK_BRIDGE_LOG overrides.
 const logFile = process.env.GROK_BRIDGE_LOG
   || (process.env.GROK_HOME ? join(process.env.GROK_HOME, "bridge.log") : join(stateDir, `${agentId}.bridge.log`));
-const sink = new LogSink({ file: logFile, tty: true });
+const sink = new LogSink({ file: logFile, tty: true, onTerminalLost: () => {
+  // The screen is gone (log-sink.ts TERMINAL LOSS). Exit as the old console.error EIO did, so no bridge outlives its lane.
+  log("error", "terminal lost (screen closed) — exiting", { logFile });
+  process.exit(129);
+} });
 
 function log(level: string, msg: string, fields?: Record<string, unknown>) {
   sink.line(JSON.stringify({ t: new Date().toISOString(), level, name: "grok-wire-bridge", agent: agentId, msg, ...fields }));
