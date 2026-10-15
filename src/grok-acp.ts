@@ -100,6 +100,11 @@ type ActiveTurn = {
   graceTimer: ReturnType<typeof setTimeout> | null;
   /** Set when the idle timer fired: whatever ends the turn now, it ends as "timeout". */
   timedOut: boolean;
+  /** Any message from grok since the prompt (incl. _x.ai/*): ends the first-output phase. */
+  heard: boolean;
+  /** The limit the armed timer uses, and which phase it guards. */
+  limitMs: number;
+  phase: "first-output" | "idle";
   sessionId: string;
 };
 
@@ -185,6 +190,7 @@ export class GrokAcpClient {
   private dispatch(msg: Json): void {
     const id = msg.id as number | undefined;
     const method = msg.method as string | undefined;
+    if (method != null) this.heardFromGrok();
 
     if (id != null && method == null) {
       // Response to one of our requests.
@@ -292,7 +298,8 @@ export class GrokAcpClient {
       sessionId,
       prompt: [{ type: "text", text }],
     });
-    const turn: ActiveTurn = { turnId, reqId, idleTimer: null, graceTimer: null, timedOut: false, sessionId };
+    const turn: ActiveTurn = { turnId, reqId, idleTimer: null, graceTimer: null, timedOut: false, sessionId,
+      heard: false, limitMs: 0, phase: "idle" };
     this.turn = turn;
     this.armIdle(turn);
     promise
@@ -300,7 +307,7 @@ export class GrokAcpClient {
         const meta = (r._meta ?? {}) as Json;
         if (turn.timedOut) {
           this.finishTurn(turn, { status: "timeout", stopReason: r.stopReason ?? null, usage: meta.usage ?? null,
-            timeout: { idleMs: this.opts.turnTimeout!.idleMs, cancelHonored: true } });
+            timeout: { idleMs: turn.limitMs, cancelHonored: true, phase: turn.phase } });
         } else {
           this.finishTurn(turn, { status: r.stopReason ?? "end_turn", usage: meta.usage ?? null });
         }
@@ -308,7 +315,7 @@ export class GrokAcpClient {
       .catch((e) => {
         this.log("error", "session/prompt failed", { turnId, err: String(e) });
         this.finishTurn(turn, turn.timedOut
-          ? { status: "timeout", timeout: { idleMs: this.opts.turnTimeout!.idleMs, cancelHonored: false } }
+          ? { status: "timeout", timeout: { idleMs: turn.limitMs, cancelHonored: false, phase: turn.phase } }
           : { status: "error" });
       });
     // Resolve synchronously-ish so the gate marks the turn in-flight immediately.
@@ -317,9 +324,24 @@ export class GrokAcpClient {
 
   private armIdle(turn: ActiveTurn): void {
     const idleMs = this.opts.turnTimeout?.idleMs ?? 0;
-    if (idleMs <= 0) return;
+    const firstMs = this.opts.turnTimeout?.firstOutputMs ?? 0;
+    // Before grok has said anything, the shorter first-output limit guards the turn (it never LENGTHENS it).
+    const first = !turn.heard && firstMs > 0 && (idleMs <= 0 || firstMs < idleMs);
+    const ms = first ? firstMs : idleMs;
     if (turn.idleTimer) clearTimeout(turn.idleTimer);
-    turn.idleTimer = setTimeout(() => this.onIdle(turn), idleMs);
+    turn.idleTimer = null;
+    if (ms <= 0) return;
+    turn.limitMs = ms;
+    turn.phase = first ? "first-output" : "idle";
+    turn.idleTimer = setTimeout(() => this.onIdle(turn), ms);
+  }
+
+  /** ANY message from grok for the running turn ends its first-output phase; the idle rule takes over. */
+  private heardFromGrok(): void {
+    const turn = this.turn;
+    if (!turn || turn.heard || turn.timedOut) return;
+    turn.heard = true;
+    if (turn.phase === "first-output") this.armIdle(turn);
   }
 
   /** Output from grok for the running turn: restart its idle clock (not once cancelling). */
@@ -330,10 +352,13 @@ export class GrokAcpClient {
 
   private onIdle(turn: ActiveTurn): void {
     if (this.turn !== turn) return;
-    const { idleMs, graceMs } = this.opts.turnTimeout!;
+    const { graceMs } = this.opts.turnTimeout!;
+    const idleMs = turn.limitMs, phase = turn.phase;
     turn.timedOut = true;
     turn.idleTimer = null;
-    this.log("error", "turn idle timeout — no output from grok; sending session/cancel", { turnId: turn.turnId, idleMs, graceMs });
+    this.log("error", phase === "first-output"
+      ? "turn first-output timeout — NOTHING from grok since the prompt; sending session/cancel"
+      : "turn idle timeout — no output from grok; sending session/cancel", { turnId: turn.turnId, idleMs, graceMs, phase });
     try {
       this.cancelTurn(turn.sessionId);
     } catch (e) {
@@ -344,7 +369,7 @@ export class GrokAcpClient {
       // The prompt never resolved, even after cancel: abandon it. A late reply for reqId is dropped by dispatch.
       this.pending.delete(turn.reqId);
       this.log("error", "session/cancel not honoured within grace — abandoning the turn; grok child may be wedged", { turnId: turn.turnId, graceMs });
-      this.finishTurn(turn, { status: "timeout", timeout: { idleMs, cancelHonored: false } });
+      this.finishTurn(turn, { status: "timeout", timeout: { idleMs, cancelHonored: false, phase } });
     }, graceMs);
   }
 

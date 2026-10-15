@@ -16,12 +16,12 @@ type Done = { id: string; status: string; timeout?: { idleMs: number; cancelHono
 let clients: GrokAcpClient[] = [];
 afterEach(() => { for (const c of clients) c.stop(); clients = []; });
 
-async function harness(idleMs = IDLE) {
+async function harness(idleMs = IDLE, firstOutputMs?: number) {
   const logPath = join(mkdtempSync(join(tmpdir(), "fake-grok-")), "in.jsonl");
   process.env.FAKE_GROK_LOG = logPath;
   const done: Done[] = [];
   const c = new GrokAcpClient({
-    cwd: tmpdir(), grokBin: FAKE, turnTimeout: { idleMs, graceMs: GRACE },
+    cwd: tmpdir(), grokBin: FAKE, turnTimeout: { idleMs, graceMs: GRACE, firstOutputMs },
     onNotification: (m, p) => { if (m === "turn/completed") done.push((p as { turn: Done }).turn); },
   });
   clients.push(c);
@@ -101,13 +101,53 @@ describe("per-turn idle timeout (stalled model call)", () => {
   });
 });
 
+// 0.1.10 (Brioche 722285): rv843 wedged with NOTHING from grok after the prompt; first-output limit catches it early.
+const FIRST = 60;
+describe("first-output limit (grok silent since the prompt)", () => {
+  test("total silence times out at the first-output limit, not the idle limit, phase first-output", async () => {
+    const h = await harness(IDLE * 4, FIRST);
+    const t0 = Date.now();
+    await h.c.startTurn(h.threadId, "STALL");
+    await until(() => h.done.length === 1);
+    const took = Date.now() - t0;
+    expect(h.done[0]).toMatchObject({ status: "timeout", timeout: { idleMs: FIRST, cancelHonored: false, phase: "first-output" } });
+    expect(took).toBeGreaterThanOrEqual(FIRST + GRACE - 10);
+    expect(took).toBeLessThan(IDLE * 4);
+  });
+  test("_x.ai/* chatter ends the first-output phase: the turn times out on the IDLE rule, not the first-output one", async () => {
+    const h = await harness(IDLE, FIRST);
+    const t0 = Date.now();
+    await h.c.startTurn(h.threadId, "XAI_ONLY:20");
+    await until(() => h.done.length === 1);
+    expect(h.done[0]).toMatchObject({ status: "timeout", timeout: { idleMs: IDLE, phase: "idle" } });
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(IDLE + GRACE - 10);
+  });
+  test("a live streaming turn is untouched by the first-output limit", async () => {
+    const h = await harness(IDLE, FIRST);
+    await h.c.startTurn(h.threadId, "ACTIVE:12");
+    await until(() => h.done.length === 1);
+    expect(h.done[0].status).toBe("end_turn");
+    expect(h.sent().some((m) => m.method === "session/cancel")).toBe(false);
+  });
+  test("a first-output limit longer than the idle limit never lengthens it", async () => {
+    const h = await harness(IDLE, IDLE * 10);
+    await h.c.startTurn(h.threadId, "STALL");
+    await until(() => h.done.length === 1);
+    expect(h.done[0]).toMatchObject({ timeout: { idleMs: IDLE, phase: "idle" } });
+  });
+});
+
 describe("turnTimeoutFromEnv", () => {
+  test("first-output default 120 s; 0 disables", () => {
+    expect(turnTimeoutFromEnv({}, () => {}).firstOutputMs).toBe(120_000);
+    expect(turnTimeoutFromEnv({ GROK_TURN_FIRST_OUTPUT_SECS: "0" }, () => {}).firstOutputMs).toBe(0);
+  });
   test("defaults: 600 s idle, 30 s grace", () => {
-    expect(turnTimeoutFromEnv({}, () => {})).toEqual({ idleMs: 600_000, graceMs: 30_000 });
+    expect(turnTimeoutFromEnv({}, () => {})).toEqual({ idleMs: 600_000, graceMs: 30_000, firstOutputMs: 120_000 });
   });
   test("per-agent knob and 0 = disabled", () => {
     expect(turnTimeoutFromEnv({ GROK_TURN_TIMEOUT_SECS: "1200", GROK_TURN_CANCEL_GRACE_SECS: "5" }, () => {}))
-      .toEqual({ idleMs: 1_200_000, graceMs: 5_000 });
+      .toEqual({ idleMs: 1_200_000, graceMs: 5_000, firstOutputMs: 120_000 });
     expect(turnTimeoutFromEnv({ GROK_TURN_TIMEOUT_SECS: "0" }, () => {}).idleMs).toBe(0);
   });
   test("garbage falls back to the default AND is reported", () => {

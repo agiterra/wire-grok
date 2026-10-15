@@ -16,10 +16,19 @@
 import type { QueuedEvent } from "./gate.js";
 
 export const DEFAULT_TURN_TIMEOUT_SECS = 600;
+/**
+ * FIRST-OUTPUT limit (0.1.10, Brioche 722285): a turn that has heard NOTHING from grok — not even _x.ai/*
+ * bookkeeping — for this long is wedged. rv843-3923-pr1606 (2026-10-15 20:21Z): grok 1.0.13 logged "prompt
+ * received" and then nothing for 600 s, and ignored session/cancel. In 24 healthy grok lanes the first message
+ * after the prompt came within 2.2 s. ANY message ends this phase (a turn may open with a 130 s auto-compaction
+ * that grok announces only as _x.ai/session/update auto_compact_started); after it the 600 s IDLE rule applies
+ * unchanged, still counting only session/update and permission requests.
+ */
+export const DEFAULT_FIRST_OUTPUT_SECS = 120;
 export const DEFAULT_CANCEL_GRACE_SECS = 30;
 export const DEFAULT_TIMEOUT_NOTIFY = "brioche";
 
-export type TurnTimeoutConfig = { idleMs: number; graceMs: number };
+export type TurnTimeoutConfig = { idleMs: number; graceMs: number; /** 0 or omitted = off */ firstOutputMs?: number };
 
 /** Parse one seconds knob. Unset -> default; 0 -> 0 (disabled); anything unparseable -> default, reported. */
 function secs(raw: string | undefined, dflt: number, name: string, warn: (msg: string) => void): number {
@@ -32,15 +41,18 @@ function secs(raw: string | undefined, dflt: number, name: string, warn: (msg: s
   return n;
 }
 
-/** GROK_TURN_TIMEOUT_SECS (default 600; 0 disables) and GROK_TURN_CANCEL_GRACE_SECS (default 30). */
+/** GROK_TURN_TIMEOUT_SECS (default 600; 0 disables), GROK_TURN_CANCEL_GRACE_SECS (default 30), and
+ *  GROK_TURN_FIRST_OUTPUT_SECS (default 120; 0 disables). */
 export function turnTimeoutFromEnv(env: Record<string, string | undefined>, warn: (msg: string) => void): TurnTimeoutConfig {
   return {
     idleMs: secs(env.GROK_TURN_TIMEOUT_SECS, DEFAULT_TURN_TIMEOUT_SECS, "GROK_TURN_TIMEOUT_SECS", warn) * 1000,
     graceMs: secs(env.GROK_TURN_CANCEL_GRACE_SECS, DEFAULT_CANCEL_GRACE_SECS, "GROK_TURN_CANCEL_GRACE_SECS", warn) * 1000,
+    firstOutputMs: secs(env.GROK_TURN_FIRST_OUTPUT_SECS, DEFAULT_FIRST_OUTPUT_SECS, "GROK_TURN_FIRST_OUTPUT_SECS", warn) * 1000,
   };
 }
 
-export type TimeoutInfo = { idleMs: number; cancelHonored: boolean };
+/** idleMs = the limit that FIRED; phase "first-output" = grok sent nothing at all since the prompt. */
+export type TimeoutInfo = { idleMs: number; cancelHonored: boolean; phase?: "first-output" | "idle" };
 
 function csv(raw: string): string[] {
   return raw.split(",").map((s) => s.trim()).filter(Boolean);
@@ -74,10 +86,12 @@ export function timeoutNotice(opts: {
       lane: opts.lane,
       turn_id: opts.turnId,
       idle_secs: opts.info.idleMs / 1000,
+      phase: opts.info.phase ?? "idle",
       cancel_honored: opts.info.cancelHonored,
       events,
       text:
-        `${opts.lane}: turn ${opts.turnId} TIMED OUT after ${mins} min with no output from grok; ${outcome}. ` +
+        `${opts.lane}: turn ${opts.turnId} TIMED OUT after ${mins} min with ` +
+        `${opts.info.phase === "first-output" ? "NOTHING at all from grok since the prompt (wedged before its first output)" : "no output from grok"}; ${outcome}. ` +
         `Its ${events.length} event(s) (${events.map((e) => `${e.source}${e.seq != null ? ` seq ${e.seq}` : ""}`).join(", ")}) ` +
         `got no answer. Queued events continue.`,
     },
