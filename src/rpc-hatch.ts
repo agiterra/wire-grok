@@ -40,6 +40,25 @@ function framePayload(event: WireEvent): unknown {
 /** How long a request waits for a half-close before it is sent. nc's EOF follows its line within milliseconds. */
 export const DISPATCH_DELAY_MS = 100;
 
+/**
+ * What a lane may reach through this hatch. Same rules as the Codex hatch (codex-wire src/crew-rpc-hatch.ts,
+ * RPC_TARGETS); Brioche GO 2026-10-23 after the nc incident showed this hatch forwarded any dest and method.
+ * This list is transport, not authority: crew-svc and the review broker still check the caller.
+ */
+const RPC_TARGETS: ReadonlyArray<{ label: string; dest: RegExp; method: RegExp }> = [
+  { label: "crew-svc", dest: /^crew-svc@[a-zA-Z0-9._-]+$/, method: /^crew\.[a-z_]+$/ },
+  { label: "review broker", dest: /^github-review-broker@[a-zA-Z0-9._-]+$/, method: /^github\.(coderabbit_full_review|review_thread_reply)$/ },
+];
+
+/** null when (dest, method) is allowed, else the refusal reason. */
+export function rpcTargetRefusal(dest: unknown, method: unknown): string | null {
+  if (typeof dest !== "string" || typeof method !== "string") return "RPC requires a string dest and method";
+  const rule = RPC_TARGETS.find((r) => r.dest.test(dest));
+  if (!rule) return `RPC destination not allowed: ${RPC_TARGETS.map((r) => r.label).join(" or ")} only`;
+  if (!rule.method.test(method)) return `RPC method ${method} not allowed for the ${rule.label} destination`;
+  return null;
+}
+
 type Pending = {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
@@ -110,6 +129,8 @@ export function startRpcHatch(opts: {
         try {
           const msg = JSON.parse(line) as { dest?: string; method?: string; params?: unknown; timeoutMs?: number };
           if (!msg.dest || !msg.method) throw new Error("rpc-hatch: dest and method required");
+          const refusal = rpcTargetRefusal(msg.dest, msg.method);
+          if (refusal) throw new Error(refusal);
           // A half-closed client (`printf … | nc -U`) can never read the reply; sending would act unseen
           // (codex hatch incident 2026-10-23 07:57Z, double CodeRabbit post risk). Wait for its EOF; send nothing.
           await new Promise((r) => setTimeout(r, DISPATCH_DELAY_MS));
