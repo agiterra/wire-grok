@@ -37,6 +37,9 @@ function framePayload(event: WireEvent): unknown {
   return p;
 }
 
+/** How long a request waits for a half-close before it is sent. nc's EOF follows its line within milliseconds. */
+export const DISPATCH_DELAY_MS = 100;
+
 type Pending = {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
@@ -94,7 +97,9 @@ export function startRpcHatch(opts: {
 
   const server: Server = createServer((sock) => {
     let buf = "";
+    let ended = false;
     sock.setEncoding("utf8");
+    sock.on("end", () => { ended = true; });
     sock.on("data", (chunk: string) => {
       buf += chunk;
       const nl = buf.indexOf("\n");
@@ -105,6 +110,13 @@ export function startRpcHatch(opts: {
         try {
           const msg = JSON.parse(line) as { dest?: string; method?: string; params?: unknown; timeoutMs?: number };
           if (!msg.dest || !msg.method) throw new Error("rpc-hatch: dest and method required");
+          // A half-closed client (`printf … | nc -U`) can never read the reply; sending would act unseen
+          // (codex hatch incident 2026-10-23 07:57Z, double CodeRabbit post risk). Wait for its EOF; send nothing.
+          await new Promise((r) => setTimeout(r, DISPATCH_DELAY_MS));
+          if (ended || sock.destroyed) {
+            opts.log("warn", "rpc hatch client closed before dispatch; nothing sent", { method: msg.method, dest: msg.dest });
+            return;
+          }
           const result = await request(msg.dest, msg.method, msg.params, msg.timeoutMs ?? 120_000);
           sock.end(JSON.stringify({ ok: true, result }) + "\n");
         } catch (e) {
