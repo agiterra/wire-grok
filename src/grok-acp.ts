@@ -90,6 +90,14 @@ export type GrokAcpOptions = {
   turnTimeout?: TurnTimeoutConfig;
   /** grok's stderr. Given: piped here (never the terminal directly, see log-sink.ts). Omitted: inherited, as before. */
   onStderr?: (chunk: Buffer) => void;
+  /**
+   * 0.1.13: asked when the IDLE timer fires, before any cancel. Returns the epoch ms of grok's newest
+   * on-disk session write (any session under GROK_HOME, sub-agent sessions included), or null.
+   * WHY (2026-11-10, eng-4118-5673-run2e turn 1): a sub-agent call ran 12:27:54Z-12:37:34Z with tool calls,
+   * but grok sends a sub-session's updates to its own session file, not to our stdio stream. The bridge saw
+   * 600 s of silence and cancelled a working turn. A write within idleMs re-arms the clock instead.
+   */
+  lastActivityMs?: () => number | null;
 };
 
 /** The one turn in flight (TurnGate serializes, so there is never more than one). */
@@ -354,6 +362,23 @@ export class GrokAcpClient {
     if (this.turn !== turn) return;
     const { graceMs } = this.opts.turnTimeout!;
     const idleMs = turn.limitMs, phase = turn.phase;
+    if (phase === "idle" && this.opts.lastActivityMs) {
+      let last: number | null = null;
+      try {
+        last = this.opts.lastActivityMs();
+      } catch (e) {
+        this.log("error", "activity probe failed; idle timeout proceeds", { turnId: turn.turnId, err: String(e), stack: (e as Error)?.stack });
+      }
+      const quietMs = last == null ? null : Date.now() - last;
+      if (quietMs != null && quietMs < idleMs) {
+        this.log("info", "no stdio output, but a grok session file was written recently (sub-agent); idle clock re-armed",
+          { turnId: turn.turnId, idleMs, quietMs });
+        turn.idleTimer = null;
+        turn.limitMs = idleMs;
+        turn.idleTimer = setTimeout(() => this.onIdle(turn), Math.min(idleMs, Math.max(1000, idleMs - quietMs)));
+        return;
+      }
+    }
     turn.timedOut = true;
     turn.idleTimer = null;
     this.log("error", phase === "first-output"

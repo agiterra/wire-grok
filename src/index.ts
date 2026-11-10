@@ -39,6 +39,7 @@ import { startRpcHatch } from "./rpc-hatch.js";
 import { isCancelTopic, decideCancel, DEFAULT_CONTROL_ALLOW } from "./control.js";
 import { sendSignedMessage } from "@agiterra/wire-tools/http";
 import { LogSink } from "./log-sink.ts";
+import { newestSessionWriteMs } from "./session-activity.ts";
 import { turnTimeoutFromEnv, timeoutNotice, DEFAULT_TIMEOUT_NOTIFY, type TimeoutInfo } from "./turn-timeout.js";
 import { bootKickoffAlreadyDelivered, deriveKickoffId, isDuplicateKickoff, kickoffTaskText, markSuppressed, readKickoff, recordKickoff } from "./kickoff-once.ts";
 
@@ -113,6 +114,8 @@ const grok = new GrokAcpClient({
   log: (level, msg, fields) => log(level, msg, fields),
   onStderr: (chunk) => sink.raw(chunk),
   turnTimeout,
+  // 0.1.13: a sub-agent's session writes count as turn activity (session-activity.ts).
+  lastActivityMs: process.env.GROK_HOME ? () => newestSessionWriteMs(process.env.GROK_HOME!) : undefined,
   onNotification: (method, params) => {
     if (method === "turn/completed") {
       const turn = (params as { turn?: { id?: string; status?: string; usage?: unknown; timeout?: TimeoutInfo } }).turn;

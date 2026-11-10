@@ -5,10 +5,14 @@
  *   STALL_CANCEL  never answers until session/cancel, then resolves stopReason "cancelled"
  *   ACTIVE:<n>    streams a session/update every 40 ms, n times, then resolves end_turn (long but live)
  *   XAI_ONLY:<n>  streams only _x.ai/* notifications (not turn output), n times, then never answers
+ *   SUBAGENT:<n>  sends NOTHING on stdio; appends to $FAKE_GROK_HOME/sessions/c/sub/updates.jsonl every 40 ms,
+ *                 n times, then resolves end_turn (a sub-agent working in its own session, 0.1.13)
+ *   SUBAGENT_STALL:<n>  the same n writes, then never answers (a sub-agent that went quiet)
  *   anything else resolves end_turn at once
  * Every line received is appended to FAKE_GROK_LOG so tests can assert what the client sent.
  */
-import { appendFileSync } from "fs";
+import { appendFileSync, mkdirSync } from "fs";
+import { join } from "path";
 const logPath = process.env.FAKE_GROK_LOG;
 const out = (m: object) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\n");
 let stalledCancelable: number | null = null;
@@ -31,6 +35,16 @@ process.stdin.on("data", (chunk: string) => {
       const text: string = m.params.prompt[0].text;
       if (text === "STALL") { /* never answer */ }
       else if (text === "STALL_CANCEL") stalledCancelable = m.id;
+      else if (text.startsWith("SUBAGENT:") || text.startsWith("SUBAGENT_STALL:")) {
+        const stall = text.startsWith("SUBAGENT_STALL:");
+        const dir = join(process.env.FAKE_GROK_HOME!, "sessions", "c", "sub");
+        mkdirSync(dir, { recursive: true });
+        let n = Number(text.split(":")[1]);
+        const t = setInterval(() => {
+          if (n-- > 0) appendFileSync(join(dir, "updates.jsonl"), "{}\n");
+          else { clearInterval(t); if (!stall) out({ id: m.id, result: { stopReason: "end_turn" } }); }
+        }, 40);
+      }
       else if (text.startsWith("ACTIVE:") || text.startsWith("XAI_ONLY:")) {
         const xai = text.startsWith("XAI_ONLY:");
         let n = Number(text.split(":")[1]);

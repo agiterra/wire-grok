@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, existsSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { GrokAcpClient } from "./grok-acp.js";
+import { newestSessionWriteMs } from "./session-activity.ts";
 import { timeoutNotice, turnTimeoutFromEnv } from "./turn-timeout.js";
 
 // Selftest for ASK-54: plant a stalled model call in a fake `grok agent stdio` and prove the turn
@@ -16,12 +17,15 @@ type Done = { id: string; status: string; timeout?: { idleMs: number; cancelHono
 let clients: GrokAcpClient[] = [];
 afterEach(() => { for (const c of clients) c.stop(); clients = []; });
 
-async function harness(idleMs = IDLE, firstOutputMs?: number) {
-  const logPath = join(mkdtempSync(join(tmpdir(), "fake-grok-")), "in.jsonl");
+async function harness(idleMs = IDLE, firstOutputMs?: number, probe = false) {
+  const dir = mkdtempSync(join(tmpdir(), "fake-grok-"));
+  const logPath = join(dir, "in.jsonl");
   process.env.FAKE_GROK_LOG = logPath;
+  process.env.FAKE_GROK_HOME = dir;
   const done: Done[] = [];
   const c = new GrokAcpClient({
     cwd: tmpdir(), grokBin: FAKE, turnTimeout: { idleMs, graceMs: GRACE, firstOutputMs },
+    lastActivityMs: probe ? () => newestSessionWriteMs(dir) : undefined,
     onNotification: (m, p) => { if (m === "turn/completed") done.push((p as { turn: Done }).turn); },
   });
   clients.push(c);
@@ -181,5 +185,55 @@ describe("timeoutNotice", () => {
     expect(n.dests).toEqual(["brioche"]);
     expect(String(n.payload.text)).toContain("1.5 min");
     expect(String(n.payload.text)).toContain("was honoured");
+  });
+});
+
+describe("sub-agent session writes count as activity (0.1.13, eng-4118 run2e)", () => {
+  // Each turn: grok says one stdio line first, so the idle phase (not first-output) guards the rest.
+  test("a sub-agent writing its own session for 3x idle keeps the turn alive; it ends end_turn", async () => {
+    const h = await harness(IDLE, 0, true);
+    const id = await h.c.startTurn(h.threadId, `SUBAGENT:${Math.ceil((IDLE * 3) / 40)}`);
+    await until(() => h.done.length === 1);
+    expect(h.done[0]).toMatchObject({ id, status: "end_turn" });
+    expect(h.sent().some((m) => m.method === "session/cancel")).toBe(false);
+  });
+
+  test("without the probe the same turn times out (the 0.1.12 behaviour this fixes)", async () => {
+    const h = await harness(IDLE, 0, false);
+    await h.c.startTurn(h.threadId, `SUBAGENT_STALL:${Math.ceil((IDLE * 3) / 40)}`);
+    await until(() => h.done.length === 1);
+    expect(h.done[0].status).toBe("timeout");
+  });
+
+  test("a sub-agent that goes quiet still times out, idle after its last write", async () => {
+    const h = await harness(IDLE, 0, true);
+    const writes = Math.ceil((IDLE * 2) / 40);
+    const t0 = Date.now();
+    await h.c.startTurn(h.threadId, `SUBAGENT_STALL:${writes}`);
+    await until(() => h.done.length === 1);
+    const took = Date.now() - t0;
+    expect(h.done[0].status).toBe("timeout");
+    expect(took).toBeGreaterThanOrEqual(writes * 40 + IDLE - 20);
+    expect(h.sent().some((m) => m.method === "session/cancel")).toBe(true);
+  });
+
+  test("a probe that throws does not keep a stalled turn alive", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fake-grok-"));
+    process.env.FAKE_GROK_LOG = join(dir, "in.jsonl");
+    const done: Done[] = [];
+    const logs: string[] = [];
+    const c = new GrokAcpClient({
+      cwd: tmpdir(), grokBin: FAKE, turnTimeout: { idleMs: IDLE, graceMs: GRACE, firstOutputMs: 0 },
+      lastActivityMs: () => { throw new Error("EACCES probe"); },
+      log: (_l, msg) => logs.push(msg),
+      onNotification: (m, p) => { if (m === "turn/completed") done.push((p as { turn: Done }).turn); },
+    });
+    clients.push(c);
+    await c.start();
+    const { threadId } = await c.ensureThread(null);
+    await c.startTurn(threadId, "STALL");
+    await until(() => done.length === 1);
+    expect(done[0].status).toBe("timeout");
+    expect(logs.some((l) => l.startsWith("activity probe failed"))).toBe(true);
   });
 });
