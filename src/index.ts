@@ -40,6 +40,7 @@ import { isCancelTopic, decideCancel, DEFAULT_CONTROL_ALLOW } from "./control.js
 import { sendSignedMessage } from "@agiterra/wire-tools/http";
 import { LogSink } from "./log-sink.ts";
 import { newestSessionWriteMs } from "./session-activity.ts";
+import pkg from "../package.json" with { type: "json" };
 import { turnTimeoutFromEnv, timeoutNotice, DEFAULT_TIMEOUT_NOTIFY, type TimeoutInfo } from "./turn-timeout.js";
 import { bootKickoffAlreadyDelivered, deriveKickoffId, isDuplicateKickoff, kickoffTaskText, markSuppressed, readKickoff, recordKickoff } from "./kickoff-once.ts";
 
@@ -263,7 +264,7 @@ async function main(): Promise<void> {
     if (gate.push({ text: initialPrompt, topic: "bridge.boot", source: "grok-wire-bridge", seq: undefined })) void pump();
   }
 
-  log("info", "bridge up", { threadId, resumed: t.resumed, projectDir, wireUrl, model, turnTimeout, logFile });
+  log("info", "bridge up", { version: pkg.version, threadId, resumed: t.resumed, projectDir, wireUrl, model, turnTimeout, logFile });
 }
 
 main().catch((e) => {
