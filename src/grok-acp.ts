@@ -48,6 +48,44 @@ export function grokChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 }
 
 type Json = Record<string, unknown>;
+
+/**
+ * 0.2.0: which ACP agent the sidecar drives. "grok" (`grok agent stdio`, the original) or "antigravity"
+ * (Google's `agy acp`, Gemini 4 Neon; Tim 2026-11-20). Both speak the same ACP; the differences are argv,
+ * how the model is pinned, how MCP servers reach the agent, and where sub-agent activity lands on disk.
+ * VERIFIED against agy 1.5.13 (probes 2026-11-20, as _ephemeral):
+ *   - `agy acp` takes NO --model/--effort. The model (effort is part of the id: gemini-4-neon-{low,medium,high,xhigh})
+ *     is pinned in-protocol with session/set_model {sessionId, modelId}; an unknown id is REFUSED (-32602
+ *     "Unknown model ID"), so a {} answer is the proof the pin took.
+ *   - session/new|load.mcpServers [{name, command, args, env:[{name,value}]}] ARE spawned, env included.
+ *   - session/prompt resolves {stopReason, usage:{inputTokens,outputTokens,cachedReadTokens,thoughtTokens,totalTokens}}
+ *     (top-level usage, not grok's _meta.usage); session/update usage_update {used, size} is context occupancy.
+ *   - An unverified Google account answers every model call 403 "Verify your account to continue", and agy
+ *     reports it as a NORMAL end_turn whose only output is "⚠ Verification Required". Unhandled, a lane would
+ *     look idle-but-healthy forever; the client turns it into status "auth_required".
+ */
+export type AcpAgentKind = "grok" | "antigravity";
+
+export function acpAgentFromEnv(env: NodeJS.ProcessEnv): AcpAgentKind {
+  const v = (env.ACP_AGENT ?? "grok").trim().toLowerCase();
+  if (v === "grok" || v === "antigravity") return v;
+  if (v === "agy") return "antigravity";
+  throw new Error(`ACP_AGENT=${env.ACP_AGENT} is not a known ACP agent (grok | antigravity)`);
+}
+
+/** `agy acp [flags]`. --gemini-dir gives a lane its own token copy, conversations and logs. */
+export function buildAgyAcpArgs(opts: { geminiDir?: string; addDirs?: string[]; skipPermissions?: boolean }): string[] {
+  const args = ["acp"];
+  // A bridged agent has no human to answer a permission prompt (same reason grok gets --always-approve).
+  if (opts.skipPermissions !== false) args.push("--dangerously-skip-permissions");
+  args.push("--disable-telemetry");
+  if (opts.geminiDir) args.push("--gemini-dir", opts.geminiDir);
+  for (const dir of opts.addDirs ?? []) args.push("--add-dir", dir);
+  return args;
+}
+
+/** agy's whole answer to a model call refused for an unverified account (see the AcpAgentKind note). */
+export const AGY_AUTH_REQUIRED_RE = /^\s*\u26a0\s*Verification Required\s*$/;
 type Pending = { resolve: (v: Json) => void; reject: (e: Error) => void };
 
 function pluginDirsFromEnv(raw: string | undefined): string[] {
@@ -80,6 +118,10 @@ export function buildGrokAgentStdioArgs(opts: {
 export type GrokAcpOptions = {
   /** Working directory for the grok ACP session (the agent's project dir). */
   cwd: string;
+  /** 0.2.0: the ACP agent to drive (default "grok"). */
+  agent?: AcpAgentKind;
+  /** 0.2.0: ACP McpServer entries handed to session/new and session/load (agy spawns them). Default []. */
+  mcpServers?: Json[];
   /** Model id (default grok-4.5). Passed to session/new when supported. */
   model?: string;
   /** Path to the grok binary (default: GROK_BIN env or "grok" on PATH). */
@@ -114,6 +156,8 @@ type ActiveTurn = {
   limitMs: number;
   phase: "first-output" | "idle";
   sessionId: string;
+  /** The turn's agent_message_chunk text, capped: enough to recognise agy's auth-required answer. */
+  text: string;
 };
 
 export class GrokAcpClient {
@@ -134,7 +178,19 @@ export class GrokAcpClient {
     this.opts.log?.(level, msg, fields);
   }
 
+  private get agent(): AcpAgentKind {
+    return this.opts.agent ?? "grok";
+  }
+
   async start(): Promise<void> {
+    if (this.agent === "antigravity") return this.startChild(
+      this.opts.grokBin ?? process.env.AGY_BIN ?? "agy",
+      buildAgyAcpArgs({
+        geminiDir: process.env.AGY_GEMINI_DIR || undefined,
+        addDirs: pluginDirsFromEnv(process.env.AGY_ADD_DIRS),
+        skipPermissions: process.env.AGY_SKIP_PERMISSIONS !== "0",
+      }),
+    );
     const bin = this.opts.grokBin ?? process.env.GROK_BIN ?? "grok";
     // Flags belong on `grok agent`, BEFORE the `stdio` subcommand.
     // `["agent","stdio"]` with no flags was the personai boot miss: no
@@ -147,7 +203,11 @@ export class GrokAcpClient {
       noLeader: process.env.GROK_ACP_NO_LEADER !== "0",
       pluginDirs: pluginDirsFromEnv(process.env.GROK_PLUGIN_DIRS),
     });
-    this.log("info", "spawning grok agent stdio", { bin, args });
+    return this.startChild(bin, args);
+  }
+
+  private async startChild(bin: string, args: string[]): Promise<void> {
+    this.log("info", `spawning ${this.agent} ACP child`, { bin, args });
     const child = spawn(bin, args, {
       stdio: ["pipe", "pipe", this.opts.onStderr ? "pipe" : "inherit"],
       cwd: this.opts.cwd,
@@ -158,7 +218,7 @@ export class GrokAcpClient {
     child.stdout.on("data", (chunk: string) => this.onData(chunk));
     if (this.opts.onStderr && child.stderr) child.stderr.on("data", (chunk: Buffer) => this.opts.onStderr!(chunk));
     child.on("exit", (code: number | null) => {
-      this.log("error", "grok agent stdio exited", { code });
+      this.log("error", `${this.agent} ACP child exited`, { code });
       for (const [, p] of this.pending) p.reject(new Error(`grok agent exited (code ${code})`));
       this.pending.clear();
     });
@@ -169,7 +229,7 @@ export class GrokAcpClient {
     });
     const caps = (init.agentCapabilities ?? {}) as Json;
     this.loadSession = caps.loadSession === true;
-    this.log("info", "grok ACP initialized", { loadSession: this.loadSession });
+    this.log("info", `${this.agent} ACP initialized`, { loadSession: this.loadSession, agentInfo: init.agentInfo ?? null });
   }
 
   stop(): void {
@@ -229,8 +289,18 @@ export class GrokAcpClient {
       // _x.ai/* is NOT turn activity: only session/update proves the turn is producing output.
       if (method.startsWith("_x.ai/")) return;
       this.touchTurn();
+      this.captureText(method, (msg.params ?? {}) as Json);
       this.opts.onNotification?.(method, (msg.params ?? {}) as Json);
     }
+  }
+
+  private captureText(method: string, params: Json): void {
+    const turn = this.turn;
+    if (!turn || method !== "session/update" || turn.text.length >= 2000) return;
+    const update = (params.update ?? {}) as Json;
+    if (update.sessionUpdate !== "agent_message_chunk") return;
+    const t = (update.content as Json | undefined)?.text;
+    if (typeof t === "string") turn.text = (turn.text + t).slice(0, 2000);
   }
 
   /** Auto-grant a session/request_permission by selecting an allow-shaped option. */
@@ -274,22 +344,39 @@ export class GrokAcpClient {
         await this.request("session/load", {
           sessionId: persistedSessionId,
           cwd: this.opts.cwd,
-          mcpServers: [],
+          mcpServers: this.opts.mcpServers ?? [],
         });
-        this.log("info", "grok session resumed", { sessionId: persistedSessionId });
+        this.log("info", `${this.agent} session resumed`, { sessionId: persistedSessionId });
+        await this.applyModel(persistedSessionId);
         return { threadId: persistedSessionId, resumed: true };
       } catch (e) {
         this.log("warn", "session/load failed — starting fresh", { err: String(e) });
       }
     }
-    const r = await this.request("session/new", { cwd: this.opts.cwd, mcpServers: [] });
+    const r = await this.request("session/new", { cwd: this.opts.cwd, mcpServers: this.opts.mcpServers ?? [] });
     const sessionId = (r.sessionId ?? (r.session as Json | undefined)?.sessionId ?? r.id) as string | undefined;
     if (!sessionId) throw new Error(`session/new returned no sessionId: ${JSON.stringify(r)}`);
     const models = r.models as Json | undefined;
     const current = (models?.availableModels as Json[] | undefined)?.find((m) => m.modelId === models?.currentModelId);
     // reasoningEffort is what grok APPLIED: argv accepts any string, so the session answer is the proof (Brioche 651638).
-    this.log("info", "grok session started", { sessionId, model: models?.currentModelId, reasoningEffort: (current?._meta as Json | undefined)?.reasoningEffort ?? null });
+    this.log("info", `${this.agent} session started`, { sessionId, model: models?.currentModelId, reasoningEffort: (current?._meta as Json | undefined)?.reasoningEffort ?? null,
+      mcpServers: (this.opts.mcpServers ?? []).map((m) => m.name) });
+    await this.applyModel(sessionId);
     return { threadId: sessionId, resumed: false };
+  }
+
+  /**
+   * antigravity only: pin the model with session/set_model (agy acp has no --model). agy refuses an unknown id,
+   * so a resolved call is the proof. A refusal is FATAL: a lane silently on the default model is the j:719 class.
+   */
+  private async applyModel(sessionId: string): Promise<void> {
+    if (this.agent !== "antigravity" || !this.opts.model) return;
+    try {
+      await this.request("session/set_model", { sessionId, modelId: this.opts.model });
+    } catch (e) {
+      throw new Error(`session/set_model ${this.opts.model} refused: ${String(e)}`);
+    }
+    this.log("info", "model pinned (session/set_model accepted)", { sessionId, model: this.opts.model });
   }
 
   /**
@@ -307,17 +394,21 @@ export class GrokAcpClient {
       prompt: [{ type: "text", text }],
     });
     const turn: ActiveTurn = { turnId, reqId, idleTimer: null, graceTimer: null, timedOut: false, sessionId,
-      heard: false, limitMs: 0, phase: "idle" };
+      heard: false, limitMs: 0, phase: "idle", text: "" };
     this.turn = turn;
     this.armIdle(turn);
     promise
       .then((r) => {
         const meta = (r._meta ?? {}) as Json;
+        // grok reports usage at result._meta.usage; agy 1.5.13 at result.usage (probe 2026-11-20).
+        const usage = meta.usage ?? r.usage ?? null;
         if (turn.timedOut) {
-          this.finishTurn(turn, { status: "timeout", stopReason: r.stopReason ?? null, usage: meta.usage ?? null,
+          this.finishTurn(turn, { status: "timeout", stopReason: r.stopReason ?? null, usage,
             timeout: { idleMs: turn.limitMs, cancelHonored: true, phase: turn.phase } });
+        } else if (this.agent === "antigravity" && AGY_AUTH_REQUIRED_RE.test(turn.text)) {
+          this.finishTurn(turn, { status: "auth_required", stopReason: r.stopReason ?? null, text: turn.text.trim() });
         } else {
-          this.finishTurn(turn, { status: r.stopReason ?? "end_turn", usage: meta.usage ?? null });
+          this.finishTurn(turn, { status: r.stopReason ?? "end_turn", usage });
         }
       })
       .catch((e) => {

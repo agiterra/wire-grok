@@ -37,3 +37,21 @@ function list(dir: string): string[] {
     throw e;
   }
 }
+
+/**
+ * Epoch ms of the newest file write directly under `dir` (agy: <gemini-dir>/antigravity-cli/conversations/<id>.db
+ * plus its -wal), or null when there is none. Same error contract as newestSessionWriteMs: only ENOENT/ENOTDIR are
+ * "no activity", anything else throws. One --gemini-dir belongs to one lane.
+ */
+export function newestFileWriteMs(dir: string): number | null {
+  let newest: number | null = null;
+  for (const name of list(dir)) {
+    try {
+      const m = statSync(join(dir, name)).mtimeMs;
+      if (newest == null || m > newest) newest = m;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    }
+  }
+  return newest;
+}

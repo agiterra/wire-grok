@@ -24,6 +24,14 @@
  *   GROK_TURN_CANCEL_GRACE_SECS  optional — wait after session/cancel before abandoning (default 30)
  *   GROK_TURN_TIMEOUT_NOTIFY     optional — csv of agents told about a timed-out turn (default brioche)
  *
+ * 0.2.0 — ACP_AGENT=antigravity drives Google's `agy acp` (Gemini 4 Neon) instead of grok:
+ *   ACP_AGENT              optional — grok (default) | antigravity
+ *   AGY_MODEL              antigravity model id, pinned via session/set_model (default gemini-4-neon-high)
+ *   AGY_BIN                agy binary (default "agy" on PATH)
+ *   AGY_GEMINI_DIR         per-lane --gemini-dir (token copy, conversations, logs); also the activity probe root
+ *   AGY_ADD_DIRS           colon list of extra --add-dir workspace roots
+ *   ACP_MCP_SERVERS_FILE   JSON array of ACP McpServer entries for session/new|load (either agent)
+ *
  * Outbound is NOT this bridge's job: grok agents send via their wire-ipc MCP
  * entry in ~/.grok/config.toml, unchanged.
  */
@@ -32,14 +40,14 @@ import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { WireConnection } from "@agiterra/wire-tools/connection";
 import { importKeyPair } from "@agiterra/wire-tools/crypto";
-import { GrokAcpClient } from "./grok-acp.js";
+import { GrokAcpClient, acpAgentFromEnv } from "./grok-acp.js";
 import { TurnGate, formatBatch, shouldSteerInFlight, type QueuedEvent } from "./gate.js";
 import { enrichInjectedPrompt } from "./enrich.js";
 import { startRpcHatch } from "./rpc-hatch.js";
 import { isCancelTopic, decideCancel, DEFAULT_CONTROL_ALLOW } from "./control.js";
 import { sendSignedMessage } from "@agiterra/wire-tools/http";
 import { LogSink } from "./log-sink.ts";
-import { newestSessionWriteMs } from "./session-activity.ts";
+import { newestSessionWriteMs, newestFileWriteMs } from "./session-activity.ts";
 import pkg from "../package.json" with { type: "json" };
 import { turnTimeoutFromEnv, timeoutNotice, DEFAULT_TIMEOUT_NOTIFY, type TimeoutInfo } from "./turn-timeout.js";
 import { bootKickoffAlreadyDelivered, deriveKickoffId, isDuplicateKickoff, kickoffTaskText, markSuppressed, readKickoff, recordKickoff } from "./kickoff-once.ts";
@@ -57,7 +65,10 @@ const agentId = requireEnv("AGENT_ID");
 const agentName = process.env.AGENT_NAME ?? agentId;
 const wireUrl = requireEnv("WIRE_URL");
 const projectDir = requireEnv("PROJECT_DIR");
-const model = process.env.GROK_MODEL ?? "grok-4.5";
+const acpAgent = acpAgentFromEnv(process.env);
+const model = acpAgent === "antigravity"
+  ? (process.env.AGY_MODEL ?? "gemini-4-neon-high")
+  : (process.env.GROK_MODEL ?? "grok-4.5");
 const stateDir = process.env.STATE_DIR ?? join(process.env.HOME ?? "/tmp", ".wire", "grok-bridge");
 const statePath = join(stateDir, `${agentId}.json`);
 
@@ -109,19 +120,40 @@ const SKIP_TOPICS = new Set([
   "webhook.rpc.reply",
 ]);
 
+/** ACP_MCP_SERVERS_FILE: a lane's MCP servers (wire-ipc etc.), written 0600 by the launcher. Unreadable = fatal. */
+function mcpServersFromEnv(): Record<string, unknown>[] {
+  const f = process.env.ACP_MCP_SERVERS_FILE;
+  if (!f) return [];
+  const v = JSON.parse(readFileSync(f, "utf8"));
+  if (!Array.isArray(v)) throw new Error(`ACP_MCP_SERVERS_FILE ${f} is not a JSON array`);
+  return v;
+}
+
+/** Newest write by the ACP agent outside our stdio stream (sub-agents), for the idle timer (0.1.13). */
+function activityProbe(): (() => number | null) | undefined {
+  if (acpAgent === "antigravity") {
+    const dir = process.env.AGY_GEMINI_DIR;
+    return dir ? () => newestFileWriteMs(join(dir, "antigravity-cli", "conversations")) : undefined;
+  }
+  return process.env.GROK_HOME ? () => newestSessionWriteMs(process.env.GROK_HOME!) : undefined;
+}
+
 const grok = new GrokAcpClient({
   cwd: projectDir,
+  agent: acpAgent,
+  mcpServers: mcpServersFromEnv(),
   model,
   log: (level, msg, fields) => log(level, msg, fields),
   onStderr: (chunk) => sink.raw(chunk),
   turnTimeout,
   // 0.1.13: a sub-agent's session writes count as turn activity (session-activity.ts).
-  lastActivityMs: process.env.GROK_HOME ? () => newestSessionWriteMs(process.env.GROK_HOME!) : undefined,
+  lastActivityMs: activityProbe(),
   onNotification: (method, params) => {
     if (method === "turn/completed") {
       const turn = (params as { turn?: { id?: string; status?: string; usage?: unknown; timeout?: TimeoutInfo } }).turn;
-      log(turn?.status === "timeout" ? "error" : "info", "turn completed", { status: turn?.status, usage: turn?.usage, timeout: turn?.timeout });
+      log(turn?.status === "timeout" || turn?.status === "auth_required" ? "error" : "info", "turn completed", { status: turn?.status, usage: turn?.usage, timeout: turn?.timeout });
       if (turn?.status === "timeout" && turn.timeout) reportTimeout(turn.id ?? activeTurnId, turn.timeout, activeBatch);
+      if (turn?.status === "auth_required") reportAuthRequired(turn.id ?? activeTurnId, activeBatch);
       activeTurnId = "";
       activeBatch = [];
       if (gate.complete()) void pump();
@@ -141,6 +173,23 @@ function reportTimeout(turnId: string, info: TimeoutInfo, batch: QueuedEvent[]):
     sendSignedMessage(wireUrl, agentId, signingKey, "bridge.turn.timeout", payload, dest)
       .then(() => log("info", "bridge.turn.timeout sent", { to: dest, turnId }))
       .catch((e: unknown) => log("error", "bridge.turn.timeout send failed", { to: dest, turnId, err: String(e) }));
+  }
+}
+
+/**
+ * agy answered a turn with only "Verification Required" (account-level 403). Nothing the lane can fix: every
+ * later turn fails the same way. Say so on the Wire to the timeout list, once per turn, so it is never silent.
+ */
+function reportAuthRequired(turnId: string, batch: QueuedEvent[]): void {
+  const dests = (process.env.GROK_TURN_TIMEOUT_NOTIFY ?? DEFAULT_TIMEOUT_NOTIFY).split(",").map((s) => s.trim()).filter(Boolean);
+  const payload = { lane: agentId, turnId, agent: acpAgent, model, status: "auth_required",
+    detail: "agy returned 'Verification Required': the Google account needs verification (403 PERMISSION_DENIED). Every turn will fail until a human verifies it.",
+    unanswered: batch.map((e) => ({ topic: e.topic, source: e.source ?? null, seq: e.seq ?? null })) };
+  if (!signingKey) { log("error", "auth_required NOT reported — no signing key yet", { turnId, dests }); return; }
+  for (const dest of dests) {
+    sendSignedMessage(wireUrl, agentId, signingKey, "bridge.turn.auth_required", payload, dest)
+      .then(() => log("info", "bridge.turn.auth_required sent", { to: dest, turnId }))
+      .catch((e: unknown) => log("error", "bridge.turn.auth_required send failed", { to: dest, turnId, err: String(e) }));
   }
 }
 
@@ -264,7 +313,7 @@ async function main(): Promise<void> {
     if (gate.push({ text: initialPrompt, topic: "bridge.boot", source: "grok-wire-bridge", seq: undefined })) void pump();
   }
 
-  log("info", "bridge up", { version: pkg.version, threadId, resumed: t.resumed, projectDir, wireUrl, model, turnTimeout, logFile });
+  log("info", "bridge up", { version: pkg.version, acpAgent, threadId, resumed: t.resumed, projectDir, wireUrl, model, turnTimeout, logFile });
 }
 
 main().catch((e) => {
