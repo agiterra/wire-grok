@@ -19,6 +19,7 @@ import { appendFileSync, mkdirSync } from "fs";
 import { join } from "path";
 import { writeFileSync } from "fs";
 const logPath = process.env.FAKE_GROK_LOG;
+if (process.env.FAKE_GROK_PID) writeFileSync(process.env.FAKE_GROK_PID, String(process.pid));
 if (process.env.FAKE_GROK_ARGV) writeFileSync(process.env.FAKE_GROK_ARGV, JSON.stringify(process.argv.slice(2)));
 const out = (m: object) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\n");
 let stalledCancelable: number | null = null;

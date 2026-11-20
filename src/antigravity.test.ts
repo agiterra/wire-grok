@@ -108,3 +108,23 @@ test("newestFileWriteMs: newest mtime in the dir, null when the dir is missing",
   utimesSync(join(dir, "c", "a.db-wal"), 2000, 2000);
   expect(newestFileWriteMs(join(dir, "c"))).toBe(2_000_000);
 });
+
+describe("0.2.1: the ACP child never outlives the sidecar", () => {
+  for (const sig of ["SIGTERM", "SIGHUP"] as const) {
+    test(`${sig} to the sidecar takes the child down`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "exit-host-"));
+      const pidFile = join(dir, "child.pid");
+      const host = Bun.spawn(["bun", join(import.meta.dir, "fixtures", "exit-host.ts")], {
+        env: { ...process.env, FAKE_GROK_PID: pidFile, FAKE_GROK_LOG: join(dir, "in.jsonl") }, stdout: "pipe" });
+      const reader = host.stdout.getReader();
+      let out = "";
+      while (!out.includes("READY")) out += new TextDecoder().decode((await reader.read()).value);
+      const childPid = Number(readFileSync(pidFile, "utf8"));
+      const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      expect(alive(childPid)).toBe(true);
+      host.kill(sig);
+      await host.exited;
+      await until(() => !alive(childPid), 3000);
+    });
+  }
+});

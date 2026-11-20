@@ -214,6 +214,16 @@ export class GrokAcpClient {
       env: grokChildEnv(process.env),
     });
     this.child = child;
+    // 0.2.1: the child dies with us. agy 1.5.13 does NOT exit on stdin EOF: a `screen -X quit` that ended the sidecar
+    // left agy acp + its MCP servers (playwright, wallet...) running as orphans (neon-probe-1, 2026-11-20). An 'exit'
+    // listener runs on every process.exit; it must be synchronous and must never throw (bun-1-4-exit-listener-throw).
+    process.once("exit", () => {
+      try {
+        if (child.exitCode == null && child.signalCode == null) child.kill("SIGTERM");
+      } catch (e) {
+        this.log("error", "could not SIGTERM the ACP child on exit", { pid: child.pid, err: String(e), stack: (e as Error)?.stack });
+      }
+    });
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => this.onData(chunk));
     if (this.opts.onStderr && child.stderr) child.stderr.on("data", (chunk: Buffer) => this.opts.onStderr!(chunk));

@@ -316,6 +316,12 @@ async function main(): Promise<void> {
   log("info", "bridge up", { version: pkg.version, acpAgent, threadId, resumed: t.resumed, projectDir, wireUrl, model, turnTimeout, logFile });
 }
 
+// 0.2.1: a default-action signal kills bun WITHOUT running 'exit' listeners, so the ACP child would outlive us.
+// Route each one through process.exit, which runs GrokAcpClient's child-kill hook.
+for (const [sig, code] of [["SIGTERM", 143], ["SIGHUP", 129], ["SIGINT", 130]] as const) {
+  process.on(sig, () => { log("warn", `${sig} — exiting, ACP child goes down with the sidecar`); process.exit(code); });
+}
+
 main().catch((e) => {
   log("error", "fatal", { err: String(e?.stack ?? e) });
   process.exit(1);
