@@ -10,6 +10,8 @@
  *   SUBAGENT_STALL:<n>  the same n writes, then never answers (a sub-agent that went quiet)
  *   AUTHREQ       (agy, 0.2.0) one agent_message_chunk "\n\u26a0 Verification Required\n", then end_turn
  *   USAGE_TOP     (agy, 0.2.0) end_turn with usage at result.usage (agy's shape), not result._meta.usage
+ *   QUOTA         (agy, 0.2.3) session/prompt JSON-RPC error 429 RESOURCE_EXHAUSTED (shape assumed: never observed live)
+ *   RATE429       (agy, 0.2.3) session/prompt error 429 "Too many requests" (a rate limit, NOT exhaustion)
  *   anything else resolves end_turn at once
  * session/set_model (agy, 0.2.0): modelId "no-such-model" -> error -32602, anything else -> {}.
  * FAKE_GROK_ARGV, when set, receives this process's argv (JSON) at startup.
@@ -51,6 +53,8 @@ process.stdin.on("data", (chunk: string) => {
         out({ method: "session/update", params: { sessionId: "s1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "\n\u26a0 Verification Required\n" } } } });
         out({ id: m.id, result: { stopReason: "end_turn" } });
       }
+      else if (text === "QUOTA") out({ id: m.id, error: { code: 429, message: "RESOURCE_EXHAUSTED: Quota exceeded for gemini-4-neon", data: { retryDelay: "3600s" } } });
+      else if (text === "RATE429") out({ id: m.id, error: { code: 429, message: "Too many requests, please slow down" } });
       else if (text === "USAGE_TOP") out({ id: m.id, result: { stopReason: "end_turn", usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 } } });
       else if (text === "STALL_CANCEL") stalledCancelable = m.id;
       else if (text.startsWith("SUBAGENT:") || text.startsWith("SUBAGENT_STALL:")) {

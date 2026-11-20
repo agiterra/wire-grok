@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, utimesSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { GrokAcpClient, acpAgentFromEnv, buildAgyAcpArgs, AGY_AUTH_REQUIRED_RE } from "./grok-acp.js";
+import { GrokAcpClient, acpAgentFromEnv, buildAgyAcpArgs, AGY_AUTH_REQUIRED_RE, AGY_QUOTA_RE } from "./grok-acp.js";
 import { newestFileWriteMs } from "./session-activity.ts";
 
 // 0.2.0: ACP_AGENT=antigravity (Google agy acp). Shapes from the 2026-11-20 agy 1.5.13 probes.
@@ -83,6 +83,30 @@ describe("antigravity client against the fake", () => {
     await h.c.startTurn(threadId, "USAGE_TOP");
     await until(() => h.done.length === 2);
     expect(h.done[1]).toMatchObject({ status: "end_turn", usage: { totalTokens: 7 } });
+  });
+
+  test("a RESOURCE_EXHAUSTED prompt error completes as quota_exhausted with the raw error; a bare 429 stays error", async () => {
+    const h = await agy();
+    await h.c.start();
+    const { threadId } = await h.c.ensureThread(null);
+    await h.c.startTurn(threadId, "QUOTA");
+    await until(() => h.done.length === 1);
+    expect(h.done[0].status).toBe("quota_exhausted");
+    expect((h.done[0] as { err?: string }).err).toContain("retryDelay");
+    await h.c.startTurn(threadId, "RATE429");
+    await until(() => h.done.length === 2);
+    expect(h.done[1].status).toBe("error");
+    expect((h.done[1] as { err?: string }).err).toContain("Too many requests");
+    await h.c.startTurn(threadId, "USAGE_TOP");
+    await until(() => h.done.length === 3);
+    expect(h.done[2]).toMatchObject({ status: "end_turn" });
+  });
+
+  test("AGY_QUOTA_RE: exhaustion wording only", () => {
+    for (const s of ["RESOURCE_EXHAUSTED", "Quota exceeded for model", "You have exhausted your daily quota", "quota limit reached"])
+      expect(AGY_QUOTA_RE.test(s)).toBe(true);
+    for (const s of ["Too many requests", "429 rate limited", "the quota API returned 200", "checking quota usage"])
+      expect(AGY_QUOTA_RE.test(s)).toBe(false);
   });
 
   test("grok client sends no set_model (its model is argv)", async () => {

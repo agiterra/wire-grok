@@ -158,8 +158,10 @@ const grok = new GrokAcpClient({
       if (u?.sessionUpdate === "usage_update" && typeof u.used === "number") lastCtx = { used: u.used, size: typeof u.size === "number" ? u.size : null };
     }
     if (method === "turn/completed") {
-      const turn = (params as { turn?: { id?: string; status?: string; usage?: unknown; timeout?: TimeoutInfo } }).turn;
-      log(turn?.status === "timeout" || turn?.status === "auth_required" ? "error" : "info", "turn completed", { status: turn?.status, model, usage: turn?.usage, ctx: lastCtx, timeout: turn?.timeout });
+      const turn = (params as { turn?: { id?: string; status?: string; usage?: unknown; timeout?: TimeoutInfo; err?: string } }).turn;
+      // 0.2.3: status quota_exhausted|error carries err (the raw JSON-RPC error); agy-quota-watch reads these lines.
+      log(["timeout", "auth_required", "quota_exhausted", "error"].includes(turn?.status ?? "") ? "error" : "info", "turn completed",
+        { status: turn?.status, model, usage: turn?.usage, ctx: lastCtx, timeout: turn?.timeout, err: turn?.err });
       if (turn?.status === "timeout" && turn.timeout) reportTimeout(turn.id ?? activeTurnId, turn.timeout, activeBatch);
       if (turn?.status === "auth_required") reportAuthRequired(turn.id ?? activeTurnId, activeBatch);
       activeTurnId = "";

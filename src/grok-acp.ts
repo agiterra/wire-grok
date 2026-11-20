@@ -86,6 +86,13 @@ export function buildAgyAcpArgs(opts: { geminiDir?: string; addDirs?: string[]; 
 
 /** agy's whole answer to a model call refused for an unverified account (see the AcpAgentKind note). */
 export const AGY_AUTH_REQUIRED_RE = /^\s*\u26a0\s*Verification Required\s*$/;
+/**
+ * 0.2.3: a session/prompt JSON-RPC error that names quota exhaustion (Fondant, Fable-advised Neon meter design 2026-11-20).
+ * Neon quota is not readable from any agy quota API (j:2682), so the first exhaustion is the only measurement we get.
+ * Narrow on purpose: RESOURCE_EXHAUSTED, or a 429 / "quota" together with exceeded|exhausted wording. A bare rate-limit
+ * 429 is NOT matched (it is not exhaustion). Never observed live yet: the raw error text rides on the line verbatim.
+ */
+export const AGY_QUOTA_RE = /RESOURCE_EXHAUSTED|\bquota\b[^"]{0,80}\b(exceeded|exhausted|reached)\b|\b(exceeded|exhausted|reached)\b[^"]{0,80}\bquota\b/i;
 type Pending = { resolve: (v: Json) => void; reject: (e: Error) => void };
 
 function pluginDirsFromEnv(raw: string | undefined): string[] {
@@ -422,10 +429,13 @@ export class GrokAcpClient {
         }
       })
       .catch((e) => {
-        this.log("error", "session/prompt failed", { turnId, err: String(e) });
+        const err = String(e).slice(0, 4000);
+        this.log("error", "session/prompt failed", { turnId, err });
         this.finishTurn(turn, turn.timedOut
           ? { status: "timeout", timeout: { idleMs: turn.limitMs, cancelHonored: false, phase: turn.phase } }
-          : { status: "error" });
+          : this.agent === "antigravity" && AGY_QUOTA_RE.test(err)
+            ? { status: "quota_exhausted", err }
+            : { status: "error", err });
       });
     // Resolve synchronously-ish so the gate marks the turn in-flight immediately.
     return Promise.resolve(turnId);
