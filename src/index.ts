@@ -138,6 +138,8 @@ function activityProbe(): (() => number | null) | undefined {
   return process.env.GROK_HOME ? () => newestSessionWriteMs(process.env.GROK_HOME!) : undefined;
 }
 
+let lastCtx: { used: number; size: number | null } | null = null;
+
 const grok = new GrokAcpClient({
   cwd: projectDir,
   agent: acpAgent,
@@ -149,9 +151,15 @@ const grok = new GrokAcpClient({
   // 0.1.13: a sub-agent's session writes count as turn activity (session-activity.ts).
   lastActivityMs: activityProbe(),
   onNotification: (method, params) => {
+    // 0.2.2: agy reports context occupancy as session/update usage_update {used, size}. The latest one rides on the
+    // next "turn completed" line, with the model, so the lane token ledger reads both from bridge.log (j:2682).
+    if (method === "session/update") {
+      const u = (params as { update?: { sessionUpdate?: string; used?: unknown; size?: unknown } }).update;
+      if (u?.sessionUpdate === "usage_update" && typeof u.used === "number") lastCtx = { used: u.used, size: typeof u.size === "number" ? u.size : null };
+    }
     if (method === "turn/completed") {
       const turn = (params as { turn?: { id?: string; status?: string; usage?: unknown; timeout?: TimeoutInfo } }).turn;
-      log(turn?.status === "timeout" || turn?.status === "auth_required" ? "error" : "info", "turn completed", { status: turn?.status, usage: turn?.usage, timeout: turn?.timeout });
+      log(turn?.status === "timeout" || turn?.status === "auth_required" ? "error" : "info", "turn completed", { status: turn?.status, model, usage: turn?.usage, ctx: lastCtx, timeout: turn?.timeout });
       if (turn?.status === "timeout" && turn.timeout) reportTimeout(turn.id ?? activeTurnId, turn.timeout, activeBatch);
       if (turn?.status === "auth_required") reportAuthRequired(turn.id ?? activeTurnId, activeBatch);
       activeTurnId = "";
