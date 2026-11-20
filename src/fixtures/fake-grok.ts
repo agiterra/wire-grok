@@ -20,6 +20,8 @@ import { join } from "path";
 import { writeFileSync } from "fs";
 const logPath = process.env.FAKE_GROK_LOG;
 if (process.env.FAKE_GROK_PID) writeFileSync(process.env.FAKE_GROK_PID, String(process.pid));
+// agy 1.5.13 does not exit on stdin EOF; FAKE_GROK_HOLD makes the fake behave the same (0.2.1 orphan test).
+if (process.env.FAKE_GROK_HOLD) setInterval(() => {}, 1000);
 if (process.env.FAKE_GROK_ARGV) writeFileSync(process.env.FAKE_GROK_ARGV, JSON.stringify(process.argv.slice(2)));
 const out = (m: object) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\n");
 let stalledCancelable: number | null = null;

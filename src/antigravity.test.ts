@@ -115,7 +115,7 @@ describe("0.2.1: the ACP child never outlives the sidecar", () => {
       const dir = mkdtempSync(join(tmpdir(), "exit-host-"));
       const pidFile = join(dir, "child.pid");
       const host = Bun.spawn(["bun", join(import.meta.dir, "fixtures", "exit-host.ts")], {
-        env: { ...process.env, FAKE_GROK_PID: pidFile, FAKE_GROK_LOG: join(dir, "in.jsonl") }, stdout: "pipe" });
+        env: { ...process.env, FAKE_GROK_HOLD: "1", FAKE_GROK_PID: pidFile, FAKE_GROK_LOG: join(dir, "in.jsonl") }, stdout: "pipe" });
       const reader = host.stdout.getReader();
       let out = "";
       while (!out.includes("READY")) out += new TextDecoder().decode((await reader.read()).value);
